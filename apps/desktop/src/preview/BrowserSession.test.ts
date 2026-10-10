@@ -878,9 +878,9 @@ describe("BrowserSession", () => {
       }),
     );
     const [event] = yield* Fiber.join(reply);
-    assert.isDefined(event);
-    assert.strictEqual(event.type, "cdp");
-    if (event.type !== "cdp") return yield* Effect.die("Expected a CDP reply.");
+    if (event === undefined || event.type !== "cdp") {
+      return yield* Effect.die("Expected a CDP reply.");
+    }
     const replyMessage = yield* decodeCookieClearReply(event.message);
     return { reply: replyMessage, sendCommand: debuggee.sendCommand };
   });
@@ -890,6 +890,7 @@ describe("BrowserSession", () => {
       yield* Effect.gen(function* () {
         assert.isTrue(yield* accept(yield* openTab("scope-a"), page));
         assert.deepEqual(prompts[0]!.options.buttons, ["Trust and Remember", "Cancel"]);
+        assert.include(prompts[0]!.options.detail, "after you restart T3 Code");
       }).pipe(Effect.provide(layerCertificates));
 
       yield* Effect.gen(function* () {
@@ -987,6 +988,14 @@ describe("BrowserSession", () => {
         assertTrustedWithoutPrompt(certificateError(yield* openTab("scope-b"), page));
       }).pipe(Effect.provide(layerCertificates));
     }),
+  );
+
+  it.effect("forwards a cookie clear for an unmanaged Session to Chromium", () =>
+    Effect.gen(function* () {
+      const { reply, sendCommand } = yield* sendCookieClear(makeTab({}));
+      assert.deepEqual(reply, { id: 1, result: {} });
+      assert.deepEqual(sendCommand.mock.calls, [["Network.clearBrowserCookies", {}]]);
+    }).pipe(Effect.provide(layerCertificates)),
   );
 
   it.effect("reports a failed native cookie clear and removes saved trust on retry", () =>
