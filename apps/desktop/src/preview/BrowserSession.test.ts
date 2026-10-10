@@ -1,4 +1,8 @@
+// @effect-diagnostics nodeBuiltinImport:off - The mocked Electron Session needs a temporary storage folder before any Effect runs.
 import * as NodeEvents from "node:events";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -8,10 +12,12 @@ import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Scope from "effect/Scope";
-import { beforeEach, vi } from "vite-plus/test";
+import { afterEach, beforeEach, vi } from "vite-plus/test";
 
 const { fromPartition, sessions } = vi.hoisted(() => ({
   fromPartition: vi.fn(),
@@ -25,6 +31,7 @@ const { fromPartition, sessions } = vi.hoisted(() => ({
       readonly setPermissionRequestHandler: ReturnType<typeof vi.fn>;
       readonly setPermissionCheckHandler: ReturnType<typeof vi.fn>;
       readonly setUserAgent: ReturnType<typeof vi.fn>;
+      readonly storagePath: string | null;
     }
   >(),
 }));
@@ -81,6 +88,9 @@ interface OpenPrompt {
   readonly answered: Deferred.Deferred<void>;
 }
 const prompts: Array<OpenPrompt> = [];
+const openedPrompts: Array<Deferred.Deferred<void>> = [];
+/** Completes when the message box at `index` opens. */
+const promptOpened = (index: number) => (openedPrompts[index] ??= Deferred.makeUnsafe());
 const layerPromptDialog = Layer.succeed(ElectronDialog.ElectronDialog, {
   pickFolder: () => Effect.die("unused"),
   pickFiles: () => Effect.die("unused"),
@@ -93,6 +103,7 @@ const layerPromptDialog = Layer.succeed(ElectronDialog.ElectronDialog, {
         answered: Deferred.makeUnsafe(),
       };
       prompts.push(prompt);
+      Deferred.doneUnsafe(promptOpened(prompts.length - 1), Effect.void);
       return Deferred.await(prompt.response).pipe(
         Effect.map((response) => ({ response, checkboxChecked: false })),
         Effect.ensuring(Deferred.succeed(prompt.answered, undefined)),
@@ -114,6 +125,72 @@ const layerCertificatesOn = (platform: NodeJS.Platform) =>
 const layerCertificates = layerCertificatesOn("linux");
 const CONTINUE = 0;
 const CANCEL = 1;
+
+const APPROVALS_FILE = "t3code-certificate-approvals.json";
+/** A temporary folder for each test, in place of Electron's user data folder. */
+let userData = "";
+/** Where Electron keeps a partition's data. Incognito partitions have none. */
+const storagePathFor = (partition: string) =>
+  partition.startsWith("persist:")
+    ? NodePath.join(userData, "Partitions", partition.slice("persist:".length))
+    : null;
+const approvalsFileFor = (partition: string) =>
+  NodePath.join(storagePathFor(partition) ?? "", APPROVALS_FILE);
+
+/** Holds one file operation until the test releases it, or fails it. */
+interface FileHold {
+  readonly entered: Deferred.Deferred<void>;
+  readonly release: Deferred.Deferred<void, PlatformError.PlatformError>;
+}
+/**
+ * The real file system, but the test can hold the next approval write (its
+ * final rename) or the next removal of an approval file.
+ */
+const makeFileGate = (platform: NodeJS.Platform = "linux") => {
+  const holds = { rename: [] as Array<FileHold>, remove: [] as Array<FileHold> };
+  const pass = (operation: keyof typeof holds) =>
+    Effect.suspend(() => {
+      const hold = holds[operation].shift();
+      if (hold === undefined) return Effect.void;
+      return Deferred.succeed(hold.entered, undefined).pipe(
+        Effect.andThen(Deferred.await(hold.release)),
+      );
+    });
+  const layerFileSystem = Layer.effect(
+    FileSystem.FileSystem,
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      return FileSystem.FileSystem.of({
+        ...fs,
+        rename: (from, to) => pass("rename").pipe(Effect.andThen(fs.rename(from, to))),
+        remove: (path, options) =>
+          NodePath.basename(path) === APPROVALS_FILE
+            ? pass("remove").pipe(Effect.andThen(fs.remove(path, options)))
+            : fs.remove(path, options),
+      });
+    }),
+  ).pipe(Layer.provide(NodeServices.layer));
+  return {
+    hold: (operation: keyof typeof holds): FileHold => {
+      const hold: FileHold = { entered: Deferred.makeUnsafe(), release: Deferred.makeUnsafe() };
+      holds[operation].push(hold);
+      return hold;
+    },
+    layer: BrowserSession.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          layerFileSystem,
+          layerPromptDialog,
+          ElectronApp.layer,
+          Layer.succeed(HostProcess.Platform, platform),
+        ),
+      ),
+      Layer.provide(NodeServices.layer),
+    ),
+  };
+};
+const fileFailure = (method: string) =>
+  PlatformError.systemError({ _tag: "PermissionDenied", module: "FileSystem", method });
 
 const hostWindow = { id: 7 } as unknown as Electron.BrowserWindow;
 const host = { isDestroyed: () => false };
@@ -194,10 +271,45 @@ const answer = (index: number, response: number) => {
   return Deferred.succeed(prompt.response, response);
 };
 
+/** Opens a profile in the running service and returns a new tab in it. */
+const openTab = (scope: string, persistent = true) =>
+  Effect.gen(function* () {
+    const browserSessions = yield* BrowserSession.BrowserSession;
+    const partition = yield* browserSessions.getPartition(scope, persistent);
+    yield* browserSessions.getSession(scope, persistent);
+    return makeTab(sessions.get(partition));
+  });
+
+/** Continues on the prompt that the page opens, and returns the decision. */
+const accept = (contents: unknown, input: Parameters<typeof certificateError>[1]) =>
+  Effect.gen(function* () {
+    const opened = prompts.length;
+    const result = certificateError(contents, input);
+    assert.strictEqual(prompts.length, opened + 1, `${input.url} should prompt`);
+    yield* answer(opened, CONTINUE);
+    return yield* result.trusted;
+  });
+
+/** Asserts that the page opens a prompt, then cancels it. */
+const assertPrompts = (contents: unknown, input: Parameters<typeof certificateError>[1]) =>
+  Effect.gen(function* () {
+    const opened = prompts.length;
+    const result = certificateError(contents, input);
+    assert.strictEqual(prompts.length, opened + 1, `${input.url} should prompt`);
+    yield* answer(opened, CANCEL);
+    assert.isFalse(yield* result.trusted);
+  });
+
 describe("BrowserSession", () => {
+  afterEach(() => {
+    NodeFS.rmSync(userData, { recursive: true, force: true });
+  });
+
   beforeEach(() => {
+    userData = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3code-browser-session-"));
     appListeners.clear();
     prompts.length = 0;
+    openedPrompts.length = 0;
     sessions.clear();
     fromPartition.mockReset();
     fromPartition.mockImplementation((partition: string) => {
@@ -209,6 +321,7 @@ describe("BrowserSession", () => {
         setPermissionRequestHandler: vi.fn(),
         setPermissionCheckHandler: vi.fn(),
         setUserAgent: vi.fn(),
+        storagePath: storagePathFor(partition),
       };
       sessions.set(partition, browserSession);
       return browserSession;
@@ -292,6 +405,7 @@ describe("BrowserSession", () => {
           setUserAgent: vi.fn((next: string) => {
             userAgent = next;
           }),
+          storagePath: storagePathFor(partition),
         };
         sessions.set(partition, browserSession);
         return browserSession;
@@ -840,6 +954,403 @@ describe("BrowserSession", () => {
     }),
   );
 
+  const page = { url: "https://10.99.0.10/" };
+  const resource = { url: "https://10.99.0.10/app.js", isMainFrame: false };
+
+  it.effect("remembers an accepted certificate after a restart, only where it was accepted", () =>
+    Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        assert.isTrue(yield* accept(yield* openTab("scope-a"), page));
+        assert.include(
+          prompts[0]!.options.detail,
+          "until you clear the profile's cookies. The approval stays after you restart T3 Code.",
+        );
+      }).pipe(Effect.provide(layerCertificates));
+
+      yield* Effect.gen(function* () {
+        const tab = yield* openTab("scope-a");
+        // The first visit after the restart reuses it for the page, its resources, and its WebSocket.
+        for (const input of [
+          page,
+          { url: "https://10.99.0.10:443/app.js", isMainFrame: false },
+          { url: "wss://10.99.0.10/proxy/network/wss/s/default/events", isMainFrame: false },
+        ]) {
+          assertTrustedWithoutPrompt(certificateError(tab, input), input.url);
+        }
+        assert.strictEqual(prompts.length, 1);
+
+        // A new certificate, a new error, another port, or another profile asks again.
+        yield* assertPrompts(tab, { ...page, certificate: renewedCertificate });
+        yield* assertPrompts(tab, { ...page, error: "net::ERR_CERT_DATE_INVALID" });
+        yield* assertPrompts(tab, { url: "https://10.99.0.10:8443/" });
+        yield* assertPrompts(yield* openTab("scope-b"), page);
+      }).pipe(Effect.provide(layerCertificates));
+    }),
+  );
+
+  it.effect("keeps incognito approvals in memory only", () =>
+    Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        const tab = yield* openTab("scope-a", false);
+        assert.isTrue(yield* accept(tab, page));
+        assert.include(
+          prompts[0]!.options.detail,
+          "incognito tabs trust this certificate for this site until you quit T3 Code or clear their cookies.",
+        );
+        assert.notInclude(prompts[0]!.options.detail, "restart");
+        assertTrustedWithoutPrompt(certificateError(tab, resource));
+      }).pipe(Effect.provide(layerCertificates));
+      assert.deepEqual(NodeFS.readdirSync(userData), []);
+
+      yield* Effect.gen(function* () {
+        yield* assertPrompts(yield* openTab("scope-a", false), page);
+      }).pipe(Effect.provide(layerCertificates));
+    }),
+  );
+
+  it.effect("revokes saved approvals with the profile's cookies but not with its cache", () =>
+    Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        const browserSessions = yield* BrowserSession.BrowserSession;
+        assert.isTrue(yield* accept(yield* openTab("scope-a"), page));
+        assert.isTrue(yield* accept(yield* openTab("scope-b"), page));
+        yield* browserSessions.clearCache([yield* browserSessions.getPartition("scope-a")]);
+      }).pipe(Effect.provide(layerCertificates));
+
+      yield* Effect.gen(function* () {
+        const browserSessions = yield* BrowserSession.BrowserSession;
+        assertTrustedWithoutPrompt(certificateError(yield* openTab("scope-a"), page));
+        yield* browserSessions.clearCookies([yield* browserSessions.getPartition("scope-a")]);
+      }).pipe(Effect.provide(layerCertificates));
+
+      yield* Effect.gen(function* () {
+        yield* assertPrompts(yield* openTab("scope-a"), page);
+        assertTrustedWithoutPrompt(certificateError(yield* openTab("scope-b"), page));
+      }).pipe(Effect.provide(layerCertificates));
+    }),
+  );
+
+  const savedApproval = {
+    origin: "https://10.99.0.10",
+    fingerprint: "sha256/unifi",
+    error: "net::ERR_CERT_AUTHORITY_INVALID",
+  };
+  /** A saved file with the valid approval for `page` and one more entry. */
+  const savedWith = (entry: Partial<typeof savedApproval>) =>
+    JSON.stringify({ version: 1, approvals: [savedApproval, { ...savedApproval, ...entry }] });
+
+  it.effect.each([
+    { label: "is valid", contents: savedWith({ origin: "https://10.99.0.11:8443" }), valid: true },
+    { label: "is not JSON", contents: "{", valid: false },
+    {
+      label: "has another version",
+      contents: JSON.stringify({ version: 2, approvals: [savedApproval] }),
+      valid: false,
+    },
+    { label: "has a site with a path", contents: savedWith({ origin: "https://10.99.0.11/app" }) },
+    { label: "has a site with its default port", contents: savedWith({ origin: "https://x:443" }) },
+    { label: "has a fingerprint with a space", contents: savedWith({ fingerprint: "sha256/a b" }) },
+    { label: "has an empty fingerprint", contents: savedWith({ fingerprint: "" }) },
+    {
+      label: "has an error that cannot be accepted",
+      contents: savedWith({ error: "net::ERR_CERT_REVOKED" }),
+    },
+  ])("uses a saved approval file only when it is valid: $label", ({ contents, valid = false }) =>
+    Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        const browserSessions = yield* BrowserSession.BrowserSession;
+        const file = approvalsFileFor(yield* browserSessions.getPartition("scope-a"));
+        NodeFS.mkdirSync(NodePath.dirname(file), { recursive: true });
+        NodeFS.writeFileSync(file, contents);
+        const tab = yield* openTab("scope-a");
+        if (valid) {
+          assertTrustedWithoutPrompt(certificateError(tab, page));
+          return;
+        }
+        assertLeftToElectron(certificateError(tab, resource));
+        // Accepting the prompt replaces the invalid file.
+        assert.isTrue(yield* accept(tab, page));
+      }).pipe(Effect.provide(layerCertificates));
+
+      yield* Effect.gen(function* () {
+        const tab = yield* openTab("scope-a");
+        assertTrustedWithoutPrompt(certificateError(tab, page));
+        assertTrustedWithoutPrompt(certificateError(tab, resource));
+      }).pipe(Effect.provide(layerCertificates));
+    }),
+  );
+
+  it.effect.each([
+    { platform: "win32", owner: undefined, label: "without an owner" },
+    { platform: "linux", owner: hostWindow, label: "on the host window" },
+  ] as const)(
+    "denies the page when $platform cannot save an approval, and shows the error $label",
+    ({ platform, owner }) => {
+      const files = makeFileGate(platform);
+      return Effect.gen(function* () {
+        fromWebContents.mockImplementation((webContents) =>
+          webContents === host ? hostWindow : null,
+        );
+        const tab = yield* openTab("scope-a");
+        yield* Deferred.fail(files.hold("rename").release, fileFailure("rename"));
+
+        // The tab gets its answer before the user closes the error.
+        assert.isFalse(yield* accept(tab, page));
+        yield* Deferred.await(promptOpened(1));
+        const errorBox = prompts[1]!;
+        assert.strictEqual(errorBox.options.type, "error");
+        assert.strictEqual(errorBox.options.message, "T3 Code could not save your approval.");
+        assert.include(errorBox.options.detail, "The page at https://10.99.0.10 did not open.");
+        assert.strictEqual(errorBox.owner, owner);
+        yield* answer(1, 0);
+
+        assertLeftToElectron(certificateError(tab, resource));
+        yield* assertPrompts(tab, page);
+      }).pipe(Effect.provide(files.layer));
+    },
+  );
+
+  it.effect("denies a tab once when it closes while its approval fails to save", () => {
+    const files = makeFileGate();
+    return Effect.gen(function* () {
+      fromWebContents.mockImplementation((webContents) =>
+        webContents === host ? hostWindow : null,
+      );
+      const tab = yield* openTab("scope-a");
+      const write = files.hold("rename");
+      const closed = certificateError(tab, page);
+      yield* answer(0, CONTINUE);
+      yield* Deferred.await(write.entered);
+
+      tab.close();
+      assert.deepEqual(closed.callback.mock.calls, [[false]]);
+      yield* Deferred.fail(write.release, fileFailure("rename"));
+
+      // The tab is gone, so the error has no window to attach to.
+      yield* Deferred.await(promptOpened(1));
+      assert.strictEqual(prompts[1]!.options.type, "error");
+      assert.isUndefined(prompts[1]!.owner);
+      assert.deepEqual(closed.callback.mock.calls, [[false]]);
+      yield* answer(1, 0);
+      yield* Deferred.await(prompts[1]!.answered);
+      yield* assertPrompts(yield* openTab("scope-a"), page);
+    }).pipe(Effect.provide(files.layer));
+  });
+
+  it.effect("keeps both of two approvals accepted at the same time", () =>
+    Effect.gen(function* () {
+      const other = { url: "https://10.99.0.11/" };
+      yield* Effect.gen(function* () {
+        const first = certificateError(yield* openTab("scope-a"), page);
+        const second = certificateError(yield* openTab("scope-a"), other);
+        yield* answer(0, CONTINUE);
+        yield* answer(1, CONTINUE);
+        assert.isTrue(yield* first.trusted);
+        assert.isTrue(yield* second.trusted);
+      }).pipe(Effect.provide(layerCertificates));
+
+      yield* Effect.gen(function* () {
+        const tab = yield* openTab("scope-a");
+        assertTrustedWithoutPrompt(certificateError(tab, page));
+        assertTrustedWithoutPrompt(certificateError(tab, other));
+      }).pipe(Effect.provide(layerCertificates));
+    }),
+  );
+
+  it.effect("saves nothing for a prompt whose tab leaves while it waits for another write", () => {
+    const files = makeFileGate();
+    const left = { url: "https://10.99.0.11/" };
+    const later = { url: "https://10.99.0.12/" };
+    return Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        const write = files.hold("rename");
+        const first = certificateError(yield* openTab("scope-a"), page);
+        yield* answer(0, CONTINUE);
+        yield* Deferred.await(write.entered);
+
+        const leavingTab = yield* openTab("scope-a");
+        const leaving = certificateError(leavingTab, left);
+        yield* answer(1, CONTINUE);
+        yield* Deferred.await(prompts[1]!.answered);
+        leavingTab.startNavigation({ isMainFrame: true, isSameDocument: false });
+        assert.deepEqual(leaving.callback.mock.calls, [[false]]);
+        // This Continue waits behind the one whose tab left, so it ends after it.
+        const waiting = certificateError(yield* openTab("scope-a"), later);
+        yield* answer(2, CONTINUE);
+        yield* Deferred.await(prompts[2]!.answered);
+
+        yield* Deferred.succeed(write.release, undefined);
+        assert.isTrue(yield* first.trusted);
+        assert.isTrue(yield* waiting.trusted);
+        assert.deepEqual(leaving.callback.mock.calls, [[false]]);
+      }).pipe(Effect.provide(files.layer));
+
+      yield* Effect.gen(function* () {
+        const tab = yield* openTab("scope-a");
+        assertTrustedWithoutPrompt(certificateError(tab, page));
+        assertTrustedWithoutPrompt(certificateError(tab, later));
+        yield* assertPrompts(tab, left);
+      }).pipe(Effect.provide(files.layer));
+    });
+  });
+
+  it.effect("keeps an approval whose write started before its tab left", () => {
+    const files = makeFileGate();
+    return Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        const tab = yield* openTab("scope-a");
+        const write = files.hold("rename");
+        const left = certificateError(tab, page);
+        yield* answer(0, CONTINUE);
+        yield* Deferred.await(write.entered);
+        tab.startNavigation({ isMainFrame: true, isSameDocument: false });
+        assert.deepEqual(left.callback.mock.calls, [[false]]);
+
+        // This Continue waits behind the first write, so it ends after it.
+        const later = certificateError(yield* openTab("scope-a"), { url: "https://10.99.0.11/" });
+        yield* answer(1, CONTINUE);
+        yield* Deferred.await(prompts[1]!.answered);
+        yield* Deferred.succeed(write.release, undefined);
+        assert.isTrue(yield* later.trusted);
+
+        assert.deepEqual(left.callback.mock.calls, [[false]]);
+        assertTrustedWithoutPrompt(certificateError(tab, resource));
+      }).pipe(Effect.provide(files.layer));
+
+      yield* Effect.gen(function* () {
+        assertTrustedWithoutPrompt(certificateError(yield* openTab("scope-a"), page));
+      }).pipe(Effect.provide(files.layer));
+    });
+  });
+
+  it.effect(
+    "revokes an approval whose write a clear waited for, and trusts nothing until the clear ends",
+    () => {
+      const files = makeFileGate();
+      const written = { url: "https://10.99.0.11/" };
+      const cancelled = { url: "https://10.99.0.13/" };
+      const afterClear = { url: "https://10.99.0.14/" };
+      return Effect.gen(function* () {
+        yield* Effect.gen(function* () {
+          const browserSessions = yield* BrowserSession.BrowserSession;
+          const tab = yield* openTab("scope-a");
+          assert.isTrue(yield* accept(tab, page));
+          assert.isTrue(yield* accept(yield* openTab("scope-b"), page));
+          const pending = certificateError(yield* openTab("scope-a"), cancelled);
+          const write = files.hold("rename");
+          const writing = certificateError(yield* openTab("scope-a"), written);
+          yield* answer(3, CONTINUE);
+          yield* Deferred.await(write.entered);
+
+          const removal = files.hold("remove");
+          const clear = yield* browserSessions
+            .clearCookies([yield* browserSessions.getPartition("scope-a")])
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          assert.isFalse(yield* pending.trusted);
+          assert.isFalse(yield* writing.trusted);
+          // Continue on a prompt that the clear cancelled saves nothing.
+          yield* answer(2, CONTINUE);
+          yield* Deferred.await(prompts[2]!.answered);
+
+          const assertTrustsNothing = () => {
+            assertLeftToElectron(certificateError(tab, resource));
+            assertLeftToElectron(
+              certificateError(tab, { url: "https://10.99.0.11/app.js", isMainFrame: false }),
+            );
+            assertLeftToElectron(certificateError(tab, { url: "https://10.99.0.12/" }));
+            assert.strictEqual(prompts.length, 4);
+          };
+          assertTrustsNothing();
+          // The approval write ends, and the clear starts to remove the file.
+          yield* Deferred.succeed(write.release, undefined);
+          yield* Deferred.await(removal.entered);
+          assertTrustsNothing();
+          yield* Deferred.succeed(removal.release, undefined);
+          yield* Fiber.join(clear);
+
+          // This Continue waits behind the cancelled one, so it ends after it.
+          assert.isTrue(yield* accept(tab, afterClear));
+        }).pipe(Effect.provide(files.layer));
+
+        yield* Effect.gen(function* () {
+          const tab = yield* openTab("scope-a");
+          yield* assertPrompts(tab, page);
+          yield* assertPrompts(tab, written);
+          yield* assertPrompts(tab, cancelled);
+          assertTrustedWithoutPrompt(certificateError(tab, afterClear));
+          assertTrustedWithoutPrompt(certificateError(yield* openTab("scope-b"), page));
+        }).pipe(Effect.provide(files.layer));
+      });
+    },
+  );
+
+  it.effect("lets a clear be retried after its saved approvals could not be removed", () => {
+    const files = makeFileGate();
+    const cause = fileFailure("remove");
+    return Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        const browserSessions = yield* BrowserSession.BrowserSession;
+        const cleared = yield* browserSessions.getPartition("scope-a");
+        const tab = yield* openTab("scope-a");
+        assert.isTrue(yield* accept(tab, page));
+        yield* Deferred.fail(files.hold("remove").release, cause);
+
+        const error = yield* browserSessions.clearCookies([cleared]).pipe(Effect.flip);
+
+        assert.instanceOf(error, BrowserSession.BrowserSessionStorageClearError);
+        assert.equal(error.partition, cleared);
+        assert.equal(error.operation, "certificateApprovals");
+        assert.strictEqual(error.cause, cause);
+        assert.equal(
+          error.message,
+          `Cleared desktop preview browser storage for partition ${cleared}, but failed to remove its saved certificate approvals.`,
+        );
+        const clearedSession = sessions.get(cleared)!;
+        assert.deepEqual(clearedSession.clearStorageData.mock.calls, [CLEARED_STORAGES]);
+        assert.strictEqual(clearedSession.closeAllConnections.mock.calls.length, 1);
+        // Memory trust is gone, and the failed clear has ended.
+        assertLeftToElectron(certificateError(tab, resource));
+        yield* assertPrompts(tab, page);
+
+        yield* browserSessions.clearCookies([cleared]);
+        assert.strictEqual(clearedSession.clearStorageData.mock.calls.length, 2);
+        assert.strictEqual(clearedSession.closeAllConnections.mock.calls.length, 2);
+      }).pipe(Effect.provide(files.layer));
+
+      yield* Effect.gen(function* () {
+        yield* assertPrompts(yield* openTab("scope-a"), page);
+      }).pipe(Effect.provide(files.layer));
+    });
+  });
+
+  it.effect("trusts nothing until the last of two overlapping clears ends", () => {
+    const files = makeFileGate();
+    return Effect.gen(function* () {
+      const browserSessions = yield* BrowserSession.BrowserSession;
+      const partition = yield* browserSessions.getPartition("scope-a");
+      const tab = yield* openTab("scope-a");
+      const firstRemoval = files.hold("remove");
+      const secondRemoval = files.hold("remove");
+      const first = yield* browserSessions
+        .clearCookies([partition])
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(firstRemoval.entered);
+      const second = yield* browserSessions
+        .clearCookies([partition])
+        .pipe(Effect.forkChild({ startImmediately: true }));
+
+      yield* Deferred.succeed(firstRemoval.release, undefined);
+      yield* Fiber.join(first);
+      yield* Deferred.await(secondRemoval.entered);
+      assertLeftToElectron(certificateError(tab, page));
+      assert.strictEqual(prompts.length, 0);
+
+      yield* Deferred.succeed(secondRemoval.release, undefined);
+      yield* Fiber.join(second);
+      yield* assertPrompts(tab, page);
+    }).pipe(Effect.provide(files.layer));
+  });
+
   it.effect("preserves partition scope and the platform failure chain", () => {
     const nativeCause = new Error("native digest failed");
     const platformCause = PlatformError.systemError({
@@ -873,6 +1384,8 @@ describe("BrowserSession", () => {
       Effect.provide(
         BrowserSession.layer.pipe(
           Layer.provide(Layer.mergeAll(layerFailingCrypto, layerDialog, ElectronApp.layer)),
+          // Provided after the failing Crypto, so it only adds the file system.
+          Layer.provide(NodeServices.layer),
         ),
       ),
     );

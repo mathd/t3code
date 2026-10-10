@@ -1,15 +1,20 @@
 import type { Certificate, Session, WebContents } from "electron";
 import { BrowserWindow, session } from "electron";
+import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Hex from "effect/encoding/Hex";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import * as ElectronApp from "../electron/ElectronApp.ts";
@@ -107,6 +112,32 @@ const certificateOrigin = (rawUrl: string): string | null => {
   }
 };
 
+/** One certificate a user accepted for a site. */
+const CertificateApproval = Schema.Struct({
+  origin: Schema.String.check(Schema.makeFilter((origin) => certificateOrigin(origin) === origin)),
+  fingerprint: Schema.String.check(Schema.isPattern(/^\S+$/)),
+  error: Schema.String.check(
+    Schema.makeFilter((error) => OVERRIDABLE_CERTIFICATE_ERRORS.has(error)),
+  ),
+});
+type CertificateApproval = typeof CertificateApproval.Type;
+
+/** The key of an approval in memory. JSON keeps the three fields apart. */
+const certificateApprovalKey = ({ origin, fingerprint, error }: CertificateApproval): string =>
+  JSON.stringify([origin, fingerprint, error]);
+
+/**
+ * The approvals of a persistent profile, saved in its Session's storage folder.
+ * A file with one invalid entry grants nothing, so the browser asks again.
+ */
+const CERTIFICATE_APPROVALS_FILE = "t3code-certificate-approvals.json";
+const CertificateApprovalsFile = Schema.fromJsonString(
+  Schema.Struct({ version: Schema.Literal(1), approvals: Schema.Array(CertificateApproval) }),
+  { space: 2 },
+);
+const decodeCertificateApprovalsFile = Schema.decodeEffect(CertificateApprovalsFile);
+const encodeCertificateApprovalsFile = Schema.encodeEffect(CertificateApprovalsFile);
+
 const MAX_PROMPT_CERTIFICATE_NAME_LENGTH = 120;
 
 /**
@@ -134,11 +165,24 @@ interface CertificateWaiter {
   readonly release: () => void;
 }
 
+/** The certificate approvals of one preview Session. */
+interface CertificateTrust {
+  /** By `certificateApprovalKey`. */
+  readonly approvals: Map<string, CertificateApproval>;
+  /** Where the approvals are saved, or `null` for incognito: its approvals end with the Session. */
+  readonly file: string | null;
+  /** Orders approval writes and clears, so that one cannot undo the other. */
+  readonly lock: Semaphore.Semaphore;
+  /** Clears that have not ended. While one runs, the Session trusts no certificate error. */
+  clearing: number;
+}
+
 /** One open certificate prompt. Tabs that hit the same error share it. */
 interface CertificatePrompt {
-  /** The exceptions of the Session the prompt is for. */
-  readonly exceptions: Set<string>;
-  readonly exception: string;
+  /** The trust of the Session the prompt is for. */
+  readonly trust: CertificateTrust;
+  readonly approval: CertificateApproval;
+  readonly key: string;
   readonly dialog: AbortController;
   readonly waiters: Set<CertificateWaiter>;
 }
@@ -172,15 +216,19 @@ export class BrowserSessionStorageClearError extends Schema.TaggedError<BrowserS
   "BrowserSessionStorageClearError",
   {
     partition: Schema.String,
-    /** Set when storage was cleared and only closing the open connections failed. */
-    operation: Schema.optional(Schema.Literal("closeConnections")),
+    /** Set when storage was cleared and a remaining cleanup step failed. */
+    operation: Schema.optional(Schema.Literals(["closeConnections", "certificateApprovals"])),
     cause: Schema.Defect(),
   },
 ) {
   override get message(): string {
-    return this.operation === "closeConnections"
-      ? `Cleared desktop preview browser storage for partition ${this.partition}, but failed to close its open connections.`
-      : `Failed to clear desktop preview browser storage for partition ${this.partition}.`;
+    if (this.operation === "closeConnections") {
+      return `Cleared desktop preview browser storage for partition ${this.partition}, but failed to close its open connections.`;
+    }
+    if (this.operation === "certificateApprovals") {
+      return `Cleared desktop preview browser storage for partition ${this.partition}, but failed to remove its saved certificate approvals.`;
+    }
+    return `Failed to clear desktop preview browser storage for partition ${this.partition}.`;
   }
 }
 
@@ -284,7 +332,9 @@ export const make = Effect.gen(function* BrowserSessionMake() {
   const electronApp = yield* ElectronApp.ElectronApp;
   const electronDialog = yield* ElectronDialog.ElectronDialog;
   const platform = yield* HostProcess.Platform;
-  const runFork = Effect.runForkWith(yield* Effect.context<never>());
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const runFork = Effect.runForkWith(yield* Effect.context<FileSystem.FileSystem | Path.Path>());
   // One prompt at a time, so a page cannot stack dialogs by looping a deep link.
   let externalPromptOpen = false;
   /**
@@ -333,21 +383,57 @@ export const make = Effect.gen(function* BrowserSessionMake() {
   };
 
   /**
-   * The preview Sessions this service created, each with the certificate
-   * exceptions the user accepted in it. An exception is
-   * `origin fingerprint error`. It lasts until the profile's cookies are
-   * cleared or the app quits. Electron has no Chromium SSL host state store, so
-   * without this map a reload would prompt again and page resources would fail.
+   * The preview Sessions this service created, each with the certificates the
+   * user accepted in it. An approval covers one origin, certificate, and error.
+   * It lasts until the profile's cookies are cleared. A persistent profile saves
+   * its approvals, so they stay after a restart. Electron has no Chromium SSL
+   * host state store, so without this map a reload would prompt again and page
+   * resources would fail.
    */
-  const certificateExceptions = new WeakMap<Session, Set<string>>();
+  const certificateTrust = new WeakMap<Session, CertificateTrust>();
   const certificatePrompts = new Set<CertificatePrompt>();
+  /** Reads a profile's saved approvals. A missing or invalid file grants none. */
+  const loadCertificateApprovals = (file: string) =>
+    fs.readFileString(file).pipe(
+      Effect.flatMap(decodeCertificateApprovalsFile),
+      Effect.map(
+        ({ approvals }) =>
+          new Map(approvals.map((approval) => [certificateApprovalKey(approval), approval])),
+      ),
+      Effect.catch((error) =>
+        (error._tag === "PlatformError" && error.reason._tag === "NotFound"
+          ? Effect.void
+          : Effect.logWarning("Ignored the saved certificate approvals. The browser asks again.", {
+              file,
+              error,
+            })
+        ).pipe(Effect.as(new Map<string, CertificateApproval>())),
+      ),
+    );
+  const makeCertificateTrust = (browserSession: Session) => {
+    const file =
+      browserSession.storagePath === null
+        ? null
+        : path.join(browserSession.storagePath, CERTIFICATE_APPROVALS_FILE);
+    return (
+      file === null
+        ? Effect.succeed(new Map<string, CertificateApproval>())
+        : loadCertificateApprovals(file)
+    ).pipe(
+      Effect.map((approvals): CertificateTrust => ({
+        approvals,
+        file,
+        lock: Semaphore.makeUnsafe(1),
+        clearing: 0,
+      })),
+    );
+  };
   /**
    * Resolves every waiting callback once. A prompt closes when its last tab
    * leaves, so a late answer finds the prompt gone and trusts nothing.
    */
   const settleCertificatePrompt = (prompt: CertificatePrompt, trusted: boolean) => {
     if (!certificatePrompts.delete(prompt)) return;
-    if (trusted) prompt.exceptions.add(prompt.exception);
     for (const waiter of prompt.waiters) {
       waiter.release();
       waiter.callback(trusted);
@@ -364,27 +450,82 @@ export const make = Effect.gen(function* BrowserSessionMake() {
     waiter.callback(false);
     if (prompt.waiters.size === 0) cancelCertificatePrompt(prompt);
   };
+  // In a user's test on Windows, a box owned by the host window blocked all
+  // mouse input, its own buttons included, until it closed. The keyboard still
+  // worked. So Windows shows certificate boxes without an owner.
+  const certificateDialogOwner = (contents: WebContents) =>
+    platform === "win32" ? undefined : previewHostWindow(contents);
+  /**
+   * Saves the approval, then trusts it. The decision is final once its write
+   * starts: a tab that leaves during the write is denied, but the approval
+   * stays. A failed write trusts nothing and tells the user.
+   */
+  const approveCertificate = (prompt: CertificatePrompt, contents: WebContents) => {
+    const { trust } = prompt;
+    return trust.lock
+      .withPermits(1)(
+        Effect.gen(function* () {
+          // Every tab left, or a clear cancelled the prompt, while it waited for the lock.
+          if (!certificatePrompts.has(prompt)) return;
+          const file = trust.file;
+          if (file !== null) {
+            const approvals = new Map(trust.approvals).set(prompt.key, prompt.approval);
+            const encoded = yield* encodeCertificateApprovalsFile({
+              version: 1,
+              approvals: [...approvals.values()],
+            });
+            yield* writeFileStringAtomically({ filePath: file, contents: encoded });
+          }
+          // A clear that started during the write removes the file after it.
+          if (trust.clearing === 0) trust.approvals.set(prompt.key, prompt.approval);
+          settleCertificatePrompt(prompt, true);
+        }),
+      )
+      .pipe(
+        Effect.catch((error) =>
+          Effect.gen(function* () {
+            settleCertificatePrompt(prompt, false);
+            yield* Effect.logWarning("Could not save a certificate approval.", {
+              file: trust.file,
+              error,
+            });
+            yield* electronDialog
+              .showMessageBox(
+                {
+                  type: "error",
+                  buttons: ["OK"],
+                  message: "T3 Code could not save your approval.",
+                  detail: `The page at ${prompt.approval.origin} did not open. Try again. If the problem continues, make sure T3 Code can write to its data folder.`,
+                },
+                certificateDialogOwner(contents),
+              )
+              .pipe(Effect.ignore({ log: true }));
+          }),
+        ),
+      );
+  };
   /**
    * Holds the navigation until the user decides. Closing the tab or starting a
    * new page in it denies the waiting navigation.
    */
   const confirmCertificate = (
     contents: WebContents,
-    exceptions: Set<string>,
-    exception: string,
+    trust: CertificateTrust,
+    approval: CertificateApproval,
+    key: string,
     details: {
-      readonly origin: string;
       readonly reason: string;
       readonly certificate: Certificate;
     },
     callback: (trusted: boolean) => void,
   ): void => {
     const shared = [...certificatePrompts].find(
-      (prompt) => prompt.exceptions === exceptions && prompt.exception === exception,
+      (prompt) => prompt.trust === trust && prompt.key === key,
     );
     const prompt: CertificatePrompt = shared ?? {
-      exceptions,
-      exception,
+      trust,
+      approval,
+      key,
       dialog: new AbortController(),
       waiters: new Set(),
     };
@@ -417,11 +558,13 @@ export const make = Effect.gen(function* BrowserSessionMake() {
             defaultId: 1,
             cancelId: 1,
             noLink: true,
-            message: `The certificate for ${details.origin} is not trusted.`,
+            message: `The certificate for ${approval.origin} is not trusted.`,
             detail: [
               details.reason,
               "",
-              "Continue only if you know the device at this address. If you continue, this browser profile trusts this certificate for this site until you clear its cookies or quit T3 Code.",
+              trust.file === null
+                ? "Continue only if you know the device at this address. If you continue, incognito tabs trust this certificate for this site until you quit T3 Code or clear their cookies."
+                : "Continue only if you know the device at this address. If you continue, this browser profile trusts this certificate for this site until you clear the profile's cookies. The approval stays after you restart T3 Code.",
               "",
               `Subject: ${promptCertificateName(certificate.subjectName)}`,
               `Issuer: ${promptCertificateName(certificate.issuerName)}`,
@@ -430,15 +573,16 @@ export const make = Effect.gen(function* BrowserSessionMake() {
             ].join("\n"),
             signal: prompt.dialog.signal,
           },
-          // In a user's test on Windows, a box owned by the host window blocked
-          // all mouse input, its own buttons included, until it closed. The
-          // keyboard still worked. So Windows shows the box without an owner.
-          platform === "win32" ? undefined : previewHostWindow(contents),
+          certificateDialogOwner(contents),
         )
         .pipe(
           Effect.map(({ response }) => response === 0),
           Effect.orElseSucceed(() => false),
-          Effect.flatMap((trusted) => Effect.sync(() => settleCertificatePrompt(prompt, trusted))),
+          Effect.flatMap((trusted) =>
+            trusted
+              ? approveCertificate(prompt, contents)
+              : Effect.sync(() => settleCertificatePrompt(prompt, false)),
+          ),
           Effect.onInterrupt(() => Effect.sync(() => cancelCertificatePrompt(prompt))),
         ),
     );
@@ -458,11 +602,13 @@ export const make = Effect.gen(function* BrowserSessionMake() {
       isMainFrame: boolean,
     ) => {
       if (contents.isDestroyed()) return;
-      const exceptions = certificateExceptions.get(contents.session);
+      const trust = certificateTrust.get(contents.session);
       const origin = certificateOrigin(url);
-      if (exceptions === undefined || origin === null) return;
-      const exception = `${origin} ${certificate.fingerprint} ${error}`;
-      if (exceptions.has(exception)) {
+      // While its cookies are cleared, a Session trusts nothing and asks nothing.
+      if (trust === undefined || trust.clearing > 0 || origin === null) return;
+      const approval = { origin, fingerprint: certificate.fingerprint, error };
+      const key = certificateApprovalKey(approval);
+      if (trust.approvals.has(key)) {
         event.preventDefault();
         callback(true);
         return;
@@ -472,13 +618,7 @@ export const make = Effect.gen(function* BrowserSessionMake() {
       const reason = OVERRIDABLE_CERTIFICATE_ERRORS.get(error);
       if (!isMainFrame || reason === undefined) return;
       event.preventDefault();
-      confirmCertificate(
-        contents,
-        exceptions,
-        exception,
-        { origin, reason, certificate },
-        callback,
-      );
+      confirmCertificate(contents, trust, approval, key, { reason, certificate }, callback);
     },
   );
   yield* Effect.addFinalizer(() =>
@@ -544,10 +684,7 @@ export const make = Effect.gen(function* BrowserSessionMake() {
           browserSession.setPermissionCheckHandler((_webContents, permission) =>
             ALLOWED_PREVIEW_PERMISSIONS.has(permission),
           );
-          certificateExceptions.set(browserSession, new Set());
-          const next = new Map(sessions);
-          next.set(partition, browserSession);
-          return [browserSession, next] as const;
+          return browserSession;
         },
         catch: (cause) =>
           new BrowserSessionCreationError({
@@ -555,9 +692,68 @@ export const make = Effect.gen(function* BrowserSessionMake() {
             partition,
             cause,
           }),
-      });
+      }).pipe(
+        // Until its approvals are loaded, Electron denies the Session's certificate errors.
+        Effect.flatMap((browserSession) =>
+          Effect.map(makeCertificateTrust(browserSession), (trust) => {
+            certificateTrust.set(browserSession, trust);
+            const next = new Map(sessions);
+            next.set(partition, browserSession);
+            return [browserSession, next] as const;
+          }),
+        ),
+      );
     });
   });
+
+  /** Removes a Session's saved approvals, after any approval write that started first. */
+  const removeSavedCertificateApprovals = (trust: CertificateTrust) =>
+    trust.lock.withPermits(1)(
+      Effect.suspend(() => {
+        trust.approvals.clear();
+        return trust.file === null ? Effect.void : fs.remove(trust.file, { force: true });
+      }),
+    );
+  /** Clears one Session's site data. Returns the failure to report, if any. */
+  const clearSessionCookies = (partition: string, browserSession: Session) => {
+    const trust = certificateTrust.get(browserSession);
+    // Run all three, so one failure does not stop the others. In this order,
+    // the first failure is the one to report.
+    return Effect.forEach(
+      [
+        Effect.tryPromise({
+          try: () =>
+            browserSession.clearStorageData({
+              storages: ["cookies", "localstorage", "indexdb", "serviceworkers"],
+            }),
+          catch: (cause) => new BrowserSessionStorageClearError({ partition, cause }),
+        }),
+        // Retry the removal even after a previous clear emptied the approvals in memory.
+        (trust === undefined ? Effect.void : removeSavedCertificateApprovals(trust)).pipe(
+          Effect.mapError(
+            (cause) =>
+              new BrowserSessionStorageClearError({
+                partition,
+                operation: "certificateApprovals",
+                cause,
+              }),
+          ),
+        ),
+        // Retry closing connections even after a previous clear dropped the approvals.
+        Effect.tryPromise({
+          try: () => browserSession.closeAllConnections(),
+          catch: (cause) =>
+            new BrowserSessionStorageClearError({
+              partition,
+              operation: "closeConnections",
+              cause,
+            }),
+        }),
+      ],
+      Effect.result,
+      { concurrency: "unbounded" },
+    ).pipe(Effect.map((results) => results.find(Result.isFailure)?.failure));
+  };
 
   return BrowserSession.of({
     getPartition,
@@ -567,53 +763,35 @@ export const make = Effect.gen(function* BrowserSessionMake() {
     getSession,
     clearCookies: Effect.fn("BrowserSession.clearCookies")(function* (partitions?) {
       const selected = selectSessions(yield* SynchronizedRef.get(sessionsRef), partitions);
-      // Certificate exceptions are site data. Drop them first, so a failed
-      // storage clear cannot leave them in place.
-      for (const [, browserSession] of selected) {
-        const exceptions = certificateExceptions.get(browserSession);
-        if (exceptions === undefined) continue;
-        exceptions.clear();
-        for (const prompt of certificatePrompts) {
-          if (prompt.exceptions === exceptions) cancelCertificatePrompt(prompt);
-        }
-      }
-      yield* Effect.forEach(
-        selected,
-        ([partition, browserSession]) =>
-          // Run both, so a failed close still clears storage. A storage failure
-          // is the one to report when both fail.
-          Effect.promise(() =>
-            Promise.allSettled([
-              (async () => {
-                // Retry closing connections even after a previous clear dropped the exceptions.
-                await browserSession.closeAllConnections();
-              })(),
-              (async () =>
-                browserSession.clearStorageData({
-                  storages: ["cookies", "localstorage", "indexdb", "serviceworkers"],
-                }))(),
-            ]),
-          ).pipe(
-            Effect.flatMap(([connections, storage]) => {
-              if (storage.status === "rejected") {
-                return Effect.fail(
-                  new BrowserSessionStorageClearError({ partition, cause: storage.reason }),
-                );
-              }
-              if (connections.status === "rejected") {
-                return Effect.fail(
-                  new BrowserSessionStorageClearError({
-                    partition,
-                    operation: "closeConnections",
-                    cause: connections.reason,
-                  }),
-                );
-              }
-              return Effect.void;
-            }),
+      const trusts = selected.flatMap(([, browserSession]) => {
+        const trust = certificateTrust.get(browserSession);
+        return trust === undefined ? [] : [trust];
+      });
+      const failures = yield* Effect.acquireUseRelease(
+        // Certificate approvals are site data. Drop them from memory first, so
+        // a failed clear cannot leave them in place.
+        Effect.sync(() => {
+          for (const trust of trusts) {
+            trust.clearing += 1;
+            trust.approvals.clear();
+            for (const prompt of certificatePrompts) {
+              if (prompt.trust === trust) cancelCertificatePrompt(prompt);
+            }
+          }
+        }),
+        () =>
+          Effect.forEach(
+            selected,
+            ([partition, browserSession]) => clearSessionCookies(partition, browserSession),
+            { concurrency: "unbounded" },
           ),
-        { concurrency: "unbounded", discard: true },
+        () =>
+          Effect.sync(() => {
+            for (const trust of trusts) trust.clearing -= 1;
+          }),
       );
+      const failure = failures.find((error) => error !== undefined);
+      if (failure !== undefined) return yield* failure;
     }),
     clearCache: Effect.fn("BrowserSession.clearCache")(function* (partitions?) {
       const sessions = yield* SynchronizedRef.get(sessionsRef);
