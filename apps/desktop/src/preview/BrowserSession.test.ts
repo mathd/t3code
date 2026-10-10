@@ -1,9 +1,15 @@
+import * as NodeEvents from "node:events";
+
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
+import * as Scope from "effect/Scope";
 import { beforeEach, vi } from "vite-plus/test";
 
 const { fromPartition, sessions } = vi.hoisted(() => ({
@@ -12,6 +18,7 @@ const { fromPartition, sessions } = vi.hoisted(() => ({
     string,
     {
       readonly clearCache: ReturnType<typeof vi.fn>;
+      readonly closeAllConnections: ReturnType<typeof vi.fn>;
       readonly clearStorageData: ReturnType<typeof vi.fn>;
       readonly getUserAgent: ReturnType<typeof vi.fn<() => string>>;
       readonly setPermissionRequestHandler: ReturnType<typeof vi.fn>;
@@ -25,13 +32,26 @@ const { fromWebContents } = vi.hoisted(() => ({
   fromWebContents: vi.fn<(webContents: unknown) => unknown>(() => null),
 }));
 
+const { appListeners } = vi.hoisted(() => ({
+  appListeners: new Map<string, (...args: unknown[]) => void>(),
+}));
+
 vi.mock("electron", () => ({
+  app: {
+    on: (eventName: string, listener: (...args: unknown[]) => void) => {
+      appListeners.set(eventName, listener);
+    },
+    removeListener: (eventName: string, listener: (...args: unknown[]) => void) => {
+      if (appListeners.get(eventName) === listener) appListeners.delete(eventName);
+    },
+  },
   BrowserWindow: { fromWebContents },
   session: {
     fromPartition,
   },
 }));
 
+import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as BrowserSession from "./BrowserSession.ts";
 
@@ -48,16 +68,132 @@ const layerDialog = Layer.succeed(ElectronDialog.ElectronDialog, {
   showErrorBox: () => Effect.void,
 });
 const layer = BrowserSession.layer.pipe(
-  Layer.provide(Layer.merge(NodeServices.layer, layerDialog)),
+  Layer.provide(Layer.mergeAll(NodeServices.layer, layerDialog, ElectronApp.layer)),
 );
+
+/** A native message box that stays open until the test answers it. */
+interface OpenPrompt {
+  readonly options: Electron.MessageBoxOptions;
+  readonly owner: Electron.BrowserWindow | undefined;
+  readonly response: Deferred.Deferred<number, ElectronDialog.ElectronDialogShowMessageBoxError>;
+  /** Completes when the service has the answer. */
+  readonly answered: Deferred.Deferred<void>;
+}
+const prompts: Array<OpenPrompt> = [];
+const layerPromptDialog = Layer.succeed(ElectronDialog.ElectronDialog, {
+  pickFolder: () => Effect.die("unused"),
+  pickFiles: () => Effect.die("unused"),
+  showMessageBox: (options, owner) =>
+    Effect.suspend(() => {
+      const prompt: OpenPrompt = {
+        options,
+        owner,
+        response: Deferred.makeUnsafe(),
+        answered: Deferred.makeUnsafe(),
+      };
+      prompts.push(prompt);
+      return Deferred.await(prompt.response).pipe(
+        Effect.map((response) => ({ response, checkboxChecked: false })),
+        Effect.ensuring(Deferred.succeed(prompt.answered, undefined)),
+      );
+    }),
+  showErrorBox: () => Effect.void,
+});
+const layerCertificates = BrowserSession.layer.pipe(
+  Layer.provide(Layer.mergeAll(NodeServices.layer, layerPromptDialog, ElectronApp.layer)),
+);
+const CONTINUE = 0;
+const CANCEL = 1;
+
+const hostWindow = { id: 7 } as unknown as Electron.BrowserWindow;
+const host = { isDestroyed: () => false };
+
+/** A preview guest, as Electron hands it to the `certificate-error` listener. */
+const makeTab = (browserSession: unknown) => {
+  let destroyed = false;
+  const tab = Object.assign(new NodeEvents.EventEmitter(), {
+    session: browserSession,
+    hostWebContents: host,
+    isDestroyed: () => destroyed,
+    close: () => {
+      destroyed = true;
+      tab.emit("destroyed");
+    },
+    startNavigation: (details: { isMainFrame: boolean; isSameDocument: boolean }) => {
+      tab.emit("did-start-navigation", details);
+    },
+  });
+  return tab;
+};
+
+// Like the UniFi controller's certificate, it is self-signed and names `UniFi`, not the IP.
+const unifiCertificate = {
+  fingerprint: "sha256/unifi",
+  subjectName: "UniFi",
+  issuerName: "UniFi",
+  validStart: 1_735_776_000,
+  validExpiry: 1_807_056_000,
+} as Electron.Certificate;
+const renewedCertificate = { ...unifiCertificate, fingerprint: "sha256/renewed" };
+
+const certificateError = (
+  contents: unknown,
+  input: {
+    readonly url: string;
+    readonly error?: string;
+    readonly certificate?: Electron.Certificate;
+    readonly isMainFrame?: boolean;
+  },
+) => {
+  const listener = appListeners.get("certificate-error");
+  assert.isDefined(listener);
+  const event = { preventDefault: vi.fn() };
+  const decision = Deferred.makeUnsafe<boolean>();
+  const callback = vi.fn((trusted: boolean) => {
+    Deferred.doneUnsafe(decision, Effect.succeed(trusted));
+  });
+  listener(
+    event,
+    contents,
+    input.url,
+    input.error ?? "net::ERR_CERT_AUTHORITY_INVALID",
+    input.certificate ?? unifiCertificate,
+    callback,
+    input.isMainFrame ?? true,
+  );
+  return { event, callback, trusted: Deferred.await(decision) };
+};
+
+/** Without `preventDefault`, Electron denies the certificate itself. */
+const assertLeftToElectron = (result: ReturnType<typeof certificateError>, label?: string) => {
+  assert.strictEqual(result.event.preventDefault.mock.calls.length, 0, label);
+  assert.strictEqual(result.callback.mock.calls.length, 0, label);
+};
+
+const assertTrustedWithoutPrompt = (
+  result: ReturnType<typeof certificateError>,
+  label?: string,
+) => {
+  assert.strictEqual(result.event.preventDefault.mock.calls.length, 1, label);
+  assert.deepEqual(result.callback.mock.calls, [[true]], label);
+};
+
+const answer = (index: number, response: number) => {
+  const prompt = prompts[index];
+  assert.isDefined(prompt, `prompt ${index} should be open`);
+  return Deferred.succeed(prompt.response, response);
+};
 
 describe("BrowserSession", () => {
   beforeEach(() => {
+    appListeners.clear();
+    prompts.length = 0;
     sessions.clear();
     fromPartition.mockReset();
     fromPartition.mockImplementation((partition: string) => {
       const browserSession = {
         clearCache: vi.fn(() => Promise.resolve()),
+        closeAllConnections: vi.fn(() => Promise.resolve()),
         clearStorageData: vi.fn(() => Promise.resolve()),
         getUserAgent: vi.fn(() => "Mozilla/5.0 Electron/41.5.0 t3code/0.0.27"),
         setPermissionRequestHandler: vi.fn(),
@@ -138,6 +274,7 @@ describe("BrowserSession", () => {
         let userAgent = nativeUserAgent;
         const browserSession = {
           clearCache: vi.fn(() => Promise.resolve()),
+          closeAllConnections: vi.fn(() => Promise.resolve()),
           clearStorageData: vi.fn(() => Promise.resolve()),
           getUserAgent: vi.fn(() => userAgent),
           setPermissionRequestHandler: vi.fn(),
@@ -277,6 +414,385 @@ describe("BrowserSession", () => {
     }).pipe(Effect.provide(layer)),
   );
 
+  it.effect("asks before a tab's first navigation continues past a certificate error", () =>
+    Effect.gen(function* () {
+      const browserSessions = yield* BrowserSession.BrowserSession;
+      const partition = yield* browserSessions.getPartition("scope-a");
+      yield* browserSessions.getSession("scope-a");
+      fromWebContents.mockImplementation((webContents) =>
+        webContents === host ? hostWindow : null,
+      );
+
+      // The app window and other sessions keep Electron's denial.
+      assertLeftToElectron(certificateError(makeTab({}), { url: "https://10.99.0.10/" }));
+
+      // The tab makes its first request before any webview registration.
+      const tab = makeTab(sessions.get(partition));
+      assertLeftToElectron(
+        certificateError(tab, { url: "https://10.99.0.10/app.js", isMainFrame: false }),
+        "an unknown page resource never prompts",
+      );
+      assertLeftToElectron(
+        certificateError(tab, { url: "https://10.99.0.10/", error: "net::ERR_CERT_REVOKED" }),
+        "a revoked certificate cannot be accepted",
+      );
+      assert.strictEqual(prompts.length, 0);
+
+      const cancelled = certificateError(tab, {
+        url: "https://admin:hunter2@10.99.0.10/manage/default?token=abc",
+        certificate: { ...unifiCertificate, subjectName: "UniFi\n\nIssuer: Trusted CA" },
+      });
+      assert.strictEqual(cancelled.event.preventDefault.mock.calls.length, 1);
+      const prompt = prompts[0];
+      assert.isDefined(prompt);
+      const { options } = prompt;
+      assert.strictEqual(prompt.owner, hostWindow);
+      assert.strictEqual(options.message, "The certificate for https://10.99.0.10 is not trusted.");
+      assert.include(options.detail, "No trusted authority issued this certificate.");
+      assert.include(options.detail, "\nSubject: UniFi Issuer: Trusted CA\nIssuer: UniFi\n");
+      assert.include(options.detail, "Valid: 2025-01-02 to 2027-04-07");
+      assert.include(options.detail, "Fingerprint: sha256/unifi");
+      for (const hidden of ["admin", "hunter2", "manage", "token"]) {
+        assert.notInclude(`${options.message}\n${options.detail}`, hidden);
+      }
+      // Enter and Escape both deny.
+      assert.strictEqual(options.buttons?.[options.defaultId ?? -1], "Cancel");
+      assert.strictEqual(options.cancelId, options.defaultId);
+
+      yield* answer(0, CANCEL);
+      assert.isFalse(yield* cancelled.trusted);
+
+      // A denial is not remembered, and a dialog that fails denies.
+      const failed = certificateError(tab, { url: "https://10.99.0.10/" });
+      assert.strictEqual(prompts.length, 2);
+      yield* Deferred.fail(
+        prompts[1]!.response,
+        new ElectronDialog.ElectronDialogShowMessageBoxError({
+          type: "warning",
+          titleLength: null,
+          messageLength: 0,
+          detailLength: null,
+          buttonCount: 2,
+          cause: new Error("dialog failed"),
+        }),
+      );
+      assert.isFalse(yield* failed.trusted);
+      assert.strictEqual(cancelled.callback.mock.calls.length, 1);
+    }).pipe(Effect.provide(layerCertificates)),
+  );
+
+  it.effect(
+    "reuses an accepted certificate only for its profile, origin, certificate, and error",
+    () =>
+      Effect.gen(function* () {
+        const browserSessions = yield* BrowserSession.BrowserSession;
+        const partition = yield* browserSessions.getPartition("env::a", true, "profile");
+        const otherPartition = yield* browserSessions.getPartition("env::b", true, "profile");
+        yield* browserSessions.getSession("env::a", true, "profile");
+        yield* browserSessions.getSession("env::b", true, "profile");
+        const tab = makeTab(sessions.get(partition));
+
+        const accepted = certificateError(tab, { url: "https://10.99.0.10/" });
+        yield* answer(0, CONTINUE);
+        assert.isTrue(yield* accepted.trusted);
+
+        // A reload, page resources, and the controller's WebSocket reuse it.
+        for (const input of [
+          { url: "https://10.99.0.10/" },
+          { url: "https://10.99.0.10:443/app.js", isMainFrame: false },
+          { url: "wss://10.99.0.10/proxy/network/wss/s/default/events", isMainFrame: false },
+        ]) {
+          assertTrustedWithoutPrompt(certificateError(tab, input), input.url);
+        }
+        assert.strictEqual(prompts.length, 1);
+
+        // Resources with another certificate or origin stay blocked.
+        assertLeftToElectron(
+          certificateError(tab, {
+            url: "https://10.99.0.10/app.js",
+            certificate: renewedCertificate,
+            isMainFrame: false,
+          }),
+        );
+        assertLeftToElectron(
+          certificateError(tab, { url: "https://10.99.0.10:8443/app.js", isMainFrame: false }),
+        );
+
+        // A new certificate, a new error, another origin, or another profile asks again.
+        for (const [contents, input] of [
+          [tab, { url: "https://10.99.0.10/", certificate: renewedCertificate }],
+          [tab, { url: "https://10.99.0.10/", error: "net::ERR_CERT_DATE_INVALID" }],
+          [tab, { url: "https://10.99.0.10:8443/" }],
+          [makeTab(sessions.get(otherPartition)), { url: "https://10.99.0.10/" }],
+        ] as const) {
+          const opened = prompts.length;
+          const asked = certificateError(contents, input);
+          assert.strictEqual(prompts.length, opened + 1, input.url);
+          yield* answer(opened, CANCEL);
+          assert.isFalse(yield* asked.trusted);
+        }
+      }).pipe(Effect.provide(layerCertificates)),
+  );
+
+  it.effect("shares one prompt between tabs and denies the tabs that close or leave", () =>
+    Effect.gen(function* () {
+      const browserSessions = yield* BrowserSession.BrowserSession;
+      const partition = yield* browserSessions.getPartition("scope-a");
+      yield* browserSessions.getSession("scope-a");
+      const closing = makeTab(sessions.get(partition));
+      const leaving = makeTab(sessions.get(partition));
+
+      const closed = certificateError(closing, { url: "https://10.99.0.10/" });
+      const left = certificateError(leaving, { url: "https://10.99.0.10/login" });
+      assert.strictEqual(prompts.length, 1);
+      const prompt = prompts[0]!;
+
+      closing.close();
+      assert.deepEqual(closed.callback.mock.calls, [[false]]);
+
+      // In-page and subframe navigations do not replace the waiting page.
+      leaving.startNavigation({ isMainFrame: true, isSameDocument: true });
+      leaving.startNavigation({ isMainFrame: false, isSameDocument: false });
+      assert.strictEqual(left.callback.mock.calls.length, 0);
+      assert.isFalse(prompt.options.signal?.aborted);
+
+      leaving.startNavigation({ isMainFrame: true, isSameDocument: false });
+      assert.deepEqual(left.callback.mock.calls, [[false]]);
+      assert.isTrue(prompt.options.signal?.aborted);
+
+      // Continue after every tab has left creates no exception.
+      yield* answer(0, CONTINUE);
+      yield* Deferred.await(prompt.answered);
+      const next = certificateError(leaving, { url: "https://10.99.0.10/" });
+      assert.strictEqual(prompts.length, 2);
+      yield* answer(1, CANCEL);
+      assert.isFalse(yield* next.trusted);
+      assert.deepEqual(closed.callback.mock.calls, [[false]]);
+      assert.deepEqual(left.callback.mock.calls, [[false]]);
+    }).pipe(Effect.provide(layerCertificates)),
+  );
+
+  it.effect("drops a profile's certificate exceptions when its cookies are cleared", () =>
+    Effect.gen(function* () {
+      const browserSessions = yield* BrowserSession.BrowserSession;
+      const cleared = yield* browserSessions.getPartition("scope-a");
+      const kept = yield* browserSessions.getPartition("scope-b");
+      yield* browserSessions.getSession("scope-a");
+      yield* browserSessions.getSession("scope-b");
+      const clearedTab = makeTab(sessions.get(cleared));
+      const keptTab = makeTab(sessions.get(kept));
+      for (const [index, tab] of [clearedTab, keptTab].entries()) {
+        const accepted = certificateError(tab, { url: "https://10.99.0.10/" });
+        yield* answer(index, CONTINUE);
+        assert.isTrue(yield* accepted.trusted);
+      }
+
+      yield* browserSessions.clearCookies([cleared]);
+
+      assert.strictEqual(sessions.get(cleared)?.closeAllConnections.mock.calls.length, 1);
+      assert.strictEqual(sessions.get(kept)?.closeAllConnections.mock.calls.length, 0);
+      assertTrustedWithoutPrompt(certificateError(keptTab, { url: "https://10.99.0.10/" }));
+      assertLeftToElectron(
+        certificateError(clearedTab, { url: "https://10.99.0.10/app.js", isMainFrame: false }),
+      );
+      const again = certificateError(clearedTab, { url: "https://10.99.0.10/" });
+      assert.strictEqual(prompts.length, 3);
+      yield* answer(2, CANCEL);
+      assert.isFalse(yield* again.trusted);
+    }).pipe(Effect.provide(layerCertificates)),
+  );
+
+  it.effect("cancels pending certificate approvals when their profile is cleared", () =>
+    Effect.gen(function* () {
+      const browserSessions = yield* BrowserSession.BrowserSession;
+      const cleared = yield* browserSessions.getPartition("scope-a");
+      const kept = yield* browserSessions.getPartition("scope-b");
+      yield* browserSessions.getSession("scope-a");
+      yield* browserSessions.getSession("scope-b");
+      const clearedTab = makeTab(sessions.get(cleared));
+      const keptTab = makeTab(sessions.get(kept));
+      const cancelled = certificateError(clearedTab, { url: "https://10.99.0.10/" });
+      const retained = certificateError(keptTab, { url: "https://10.99.0.10/" });
+
+      yield* browserSessions.clearCookies([cleared]);
+
+      assert.isFalse(yield* cancelled.trusted);
+      assert.isTrue(prompts[0]!.options.signal?.aborted);
+      assert.isFalse(prompts[1]!.options.signal?.aborted);
+      assert.strictEqual(retained.callback.mock.calls.length, 0);
+      yield* answer(0, CONTINUE);
+      yield* Deferred.await(prompts[0]!.answered);
+      assert.deepEqual(cancelled.callback.mock.calls, [[false]]);
+      yield* answer(1, CONTINUE);
+      assert.isTrue(yield* retained.trusted);
+      assertTrustedWithoutPrompt(certificateError(keptTab, { url: "https://10.99.0.10/" }));
+      assertLeftToElectron(
+        certificateError(clearedTab, { url: "https://10.99.0.10/app.js", isMainFrame: false }),
+      );
+      const again = certificateError(clearedTab, { url: "https://10.99.0.10/" });
+      assert.strictEqual(prompts.length, 3);
+      yield* answer(2, CANCEL);
+      assert.isFalse(yield* again.trusted);
+    }).pipe(Effect.provide(layerCertificates)),
+  );
+
+  /** Two profiles that each accepted the UniFi certificate. Only `cleared` gets cleared. */
+  const makeTrustedProfiles = Effect.gen(function* () {
+    const browserSessions = yield* BrowserSession.BrowserSession;
+    const cleared = yield* browserSessions.getPartition("scope-a");
+    const kept = yield* browserSessions.getPartition("scope-b");
+    yield* browserSessions.getSession("scope-a");
+    yield* browserSessions.getSession("scope-b");
+    const clearedSession = sessions.get(cleared);
+    const keptSession = sessions.get(kept);
+    assert.isDefined(clearedSession);
+    assert.isDefined(keptSession);
+    const clearedTab = makeTab(clearedSession);
+    const keptTab = makeTab(keptSession);
+    for (const [index, tab] of [clearedTab, keptTab].entries()) {
+      const accepted = certificateError(tab, { url: "https://10.99.0.10/" });
+      yield* answer(index, CONTINUE);
+      assert.isTrue(yield* accepted.trusted);
+      assert.deepEqual(accepted.callback.mock.calls, [[true]]);
+    }
+    return { browserSessions, cleared, clearedSession, clearedTab, keptSession, keptTab };
+  });
+
+  const CLEARED_STORAGES = [{ storages: ["cookies", "localstorage", "indexdb", "serviceworkers"] }];
+
+  it.effect("clears storage and reports the failure when closing connections fails", () =>
+    Effect.gen(function* () {
+      const { browserSessions, cleared, clearedSession, clearedTab, keptSession, keptTab } =
+        yield* makeTrustedProfiles;
+      const closeCause = new Error("close failed");
+      clearedSession.closeAllConnections.mockImplementationOnce(() => Promise.reject(closeCause));
+
+      const error = yield* browserSessions.clearCookies([cleared]).pipe(Effect.flip);
+
+      assert.instanceOf(error, BrowserSession.BrowserSessionStorageClearError);
+      assert.equal(error.partition, cleared);
+      assert.equal(error.operation, "closeConnections");
+      assert.strictEqual(error.cause, closeCause);
+      assert.equal(
+        error.message,
+        `Cleared desktop preview browser storage for partition ${cleared}, but failed to close its open connections.`,
+      );
+      assert.notInclude(error.message, closeCause.message);
+      assert.strictEqual(clearedSession.closeAllConnections.mock.calls.length, 1);
+      assert.deepEqual(clearedSession.clearStorageData.mock.calls, [CLEARED_STORAGES]);
+      assert.strictEqual(keptSession.closeAllConnections.mock.calls.length, 0);
+      assert.strictEqual(keptSession.clearStorageData.mock.calls.length, 0);
+      assertTrustedWithoutPrompt(certificateError(keptTab, { url: "https://10.99.0.10/" }));
+      assertLeftToElectron(
+        certificateError(clearedTab, { url: "https://10.99.0.10/app.js", isMainFrame: false }),
+      );
+      // A retry must close connections even though the first attempt already revoked trust.
+      yield* browserSessions.clearCookies([cleared]);
+      assert.strictEqual(clearedSession.closeAllConnections.mock.calls.length, 2);
+      assert.deepEqual(clearedSession.clearStorageData.mock.calls, [
+        CLEARED_STORAGES,
+        CLEARED_STORAGES,
+      ]);
+      assert.strictEqual(keptSession.closeAllConnections.mock.calls.length, 0);
+    }).pipe(Effect.provide(layerCertificates)),
+  );
+
+  it.effect("drops accepted and pending certificate trust when the storage clear fails", () =>
+    Effect.gen(function* () {
+      const { browserSessions, cleared, clearedSession, clearedTab, keptSession, keptTab } =
+        yield* makeTrustedProfiles;
+      const cancelled = certificateError(clearedTab, { url: "https://10.99.0.11/" });
+      const retained = certificateError(keptTab, { url: "https://10.99.0.11/" });
+      assert.strictEqual(prompts.length, 4);
+      const storageCause = new Error("storage clear failed");
+      clearedSession.clearStorageData.mockImplementationOnce(() => Promise.reject(storageCause));
+
+      const error = yield* browserSessions.clearCookies([cleared]).pipe(Effect.flip);
+
+      assert.instanceOf(error, BrowserSession.BrowserSessionStorageClearError);
+      assert.equal(error.partition, cleared);
+      assert.isUndefined(error.operation);
+      assert.strictEqual(error.cause, storageCause);
+      assert.equal(
+        error.message,
+        `Failed to clear desktop preview browser storage for partition ${cleared}.`,
+      );
+      assert.strictEqual(clearedSession.closeAllConnections.mock.calls.length, 1);
+      assert.strictEqual(keptSession.clearStorageData.mock.calls.length, 0);
+
+      assert.deepEqual(cancelled.callback.mock.calls, [[false]]);
+      assert.isTrue(prompts[2]!.options.signal?.aborted);
+      yield* answer(2, CONTINUE);
+      yield* Deferred.await(prompts[2]!.answered);
+      assert.deepEqual(cancelled.callback.mock.calls, [[false]]);
+      assertLeftToElectron(
+        certificateError(clearedTab, { url: "https://10.99.0.10/app.js", isMainFrame: false }),
+      );
+      assertLeftToElectron(
+        certificateError(clearedTab, { url: "https://10.99.0.11/app.js", isMainFrame: false }),
+      );
+
+      assert.isFalse(prompts[3]!.options.signal?.aborted);
+      assert.strictEqual(retained.callback.mock.calls.length, 0);
+      yield* answer(3, CONTINUE);
+      assert.isTrue(yield* retained.trusted);
+      assert.deepEqual(retained.callback.mock.calls, [[true]]);
+      assertTrustedWithoutPrompt(certificateError(keptTab, { url: "https://10.99.0.10/" }));
+    }).pipe(Effect.provide(layerCertificates)),
+  );
+
+  it.effect("reports the storage failure when closing connections also fails", () =>
+    Effect.gen(function* () {
+      const { browserSessions, cleared, clearedSession, keptSession, keptTab } =
+        yield* makeTrustedProfiles;
+      const storageCause = new Error("storage clear failed");
+      clearedSession.closeAllConnections.mockImplementationOnce(() =>
+        Promise.reject(new Error("close failed")),
+      );
+      clearedSession.clearStorageData.mockImplementationOnce(() => Promise.reject(storageCause));
+
+      const error = yield* browserSessions.clearCookies([cleared]).pipe(Effect.flip);
+
+      assert.instanceOf(error, BrowserSession.BrowserSessionStorageClearError);
+      assert.isUndefined(error.operation);
+      assert.strictEqual(error.cause, storageCause);
+      assert.equal(
+        error.message,
+        `Failed to clear desktop preview browser storage for partition ${cleared}.`,
+      );
+      assert.strictEqual(clearedSession.closeAllConnections.mock.calls.length, 1);
+      assert.deepEqual(clearedSession.clearStorageData.mock.calls, [CLEARED_STORAGES]);
+      assert.strictEqual(keptSession.closeAllConnections.mock.calls.length, 0);
+      assertTrustedWithoutPrompt(certificateError(keptTab, { url: "https://10.99.0.10/" }));
+    }).pipe(Effect.provide(layerCertificates)),
+  );
+
+  it.effect("denies waiting certificate prompts when the service stops", () =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.make();
+      const context = yield* Layer.buildWithScope(layerCertificates, scope);
+      const browserSessions = Context.get(context, BrowserSession.BrowserSession);
+      const partition = yield* browserSessions.getPartition("scope-a");
+      yield* browserSessions.getSession("scope-a");
+      const tab = makeTab(sessions.get(partition));
+      const waiting = certificateError(tab, { url: "https://10.99.0.10/" });
+      const prompt = prompts[0]!;
+
+      yield* Scope.close(scope, Exit.void);
+
+      assert.deepEqual(waiting.callback.mock.calls, [[false]]);
+      assert.isTrue(prompt.options.signal?.aborted);
+      assert.isFalse(appListeners.has("certificate-error"));
+      assert.strictEqual(tab.listenerCount("destroyed"), 0);
+      assert.strictEqual(tab.listenerCount("did-start-navigation"), 0);
+
+      // A dialog that still returns Continue cannot resolve the callback again.
+      yield* answer(0, CONTINUE);
+      yield* Deferred.await(prompt.answered);
+      assert.deepEqual(waiting.callback.mock.calls, [[false]]);
+    }),
+  );
+
   it.effect("preserves partition scope and the platform failure chain", () => {
     const nativeCause = new Error("native digest failed");
     const platformCause = PlatformError.systemError({
@@ -308,7 +824,9 @@ describe("BrowserSession", () => {
       assert.notInclude(error.message, nativeCause.message);
     }).pipe(
       Effect.provide(
-        BrowserSession.layer.pipe(Layer.provide(Layer.merge(layerFailingCrypto, layerDialog))),
+        BrowserSession.layer.pipe(
+          Layer.provide(Layer.mergeAll(layerFailingCrypto, layerDialog, ElectronApp.layer)),
+        ),
       ),
     );
   });
