@@ -1,0 +1,126 @@
+name: Certificate test builds
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  bundle:
+    if: github.repository == 'mathd/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.config.outputs.version }}
+      clerk_publishable_key: ${{ steps.config.outputs.T3CODE_CLERK_PUBLISHABLE_KEY }}
+      clerk_jwt_template: ${{ steps.config.outputs.T3CODE_CLERK_JWT_TEMPLATE }}
+      clerk_cli_oauth_client_id: ${{ steps.config.outputs.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
+      relay_url: ${{ steps.config.outputs.T3CODE_RELAY_URL }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - name: Read public build configuration
+        id: config
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const keys = new Set(['T3CODE_CLERK_PUBLISHABLE_KEY', 'T3CODE_CLERK_JWT_TEMPLATE', 'T3CODE_CLERK_CLI_OAUTH_CLIENT_ID', 'T3CODE_RELAY_URL']);
+          const config = fs.readFileSync('.env.example', 'utf8').split('\n').filter(line => keys.has(line.split('=')[0]));
+          if (config.length !== keys.size) throw new Error('Missing public build configuration');
+          fs.appendFileSync(process.env.GITHUB_ENV, config.join('\n') + '\n');
+          const base = JSON.parse(fs.readFileSync('apps/desktop/package.json', 'utf8')).version.split('-')[0];
+          const date = new Date().toISOString().slice(0, 10).replaceAll('-', '');
+          const version = `${base}-preview.${date}.${process.env.GITHUB_RUN_NUMBER}`;
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, config.join('\n') + `\nversion=${version}\n`);
+          NODE
+      - name: Install dependencies
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+      - name: Align preview versions
+        env:
+          PREVIEW_VERSION: ${{ steps.config.outputs.version }}
+        run: node scripts/update-release-package-versions.ts "$PREVIEW_VERSION"
+      - name: Install browser helper build libraries
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+      - name: Build desktop bundle
+        run: vp run build:desktop
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 7
+
+  linux_runtime:
+    needs: bundle
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      label: Linux x64
+      runner: ubuntu-24.04
+      platform: linux
+      target: AppImage
+      arch: x64
+      rust_target: x86_64-unknown-linux-gnu
+      resource_key: linux-x64
+      cli_archive: true
+      version: ${{ needs.bundle.outputs.version }}
+      ref: ${{ github.sha }}
+      release_channel: preview
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ needs.bundle.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ needs.bundle.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ needs.bundle.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ needs.bundle.outputs.relay_url }}
+
+  windows:
+    needs: bundle
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      label: Windows x64
+      runner: windows-2025
+      platform: win
+      target: nsis
+      arch: x64
+      rust_target: x86_64-pc-windows-msvc
+      resource_key: win32-x64
+      version: ${{ needs.bundle.outputs.version }}
+      ref: ${{ github.sha }}
+      release_channel: preview
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ needs.bundle.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ needs.bundle.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ needs.bundle.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ needs.bundle.outputs.relay_url }}
+
+  mac:
+    needs: bundle
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      label: macOS arm64
+      runner: macos-15
+      platform: mac
+      target: dmg
+      arch: arm64
+      rust_target: aarch64-apple-darwin
+      resource_key: darwin-arm64
+      version: ${{ needs.bundle.outputs.version }}
+      ref: ${{ github.sha }}
+      release_channel: preview
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ needs.bundle.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ needs.bundle.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ needs.bundle.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ needs.bundle.outputs.relay_url }}
