@@ -1,14 +1,17 @@
-import type { Session, WebContents } from "electron";
+import type { Certificate, Session, WebContents } from "electron";
 import { BrowserWindow, session } from "electron";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Hex from "effect/encoding/Hex";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
+import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronDialog from "../electron/ElectronDialog.ts";
 
 const PREVIEW_PARTITION_PREFIX = "persist:t3code-preview-";
@@ -80,6 +83,65 @@ const externalProtocolPromptUrl = (rawUrl: string | undefined): string | null =>
 
 const MAX_PROMPT_URL_LENGTH = 300;
 
+/**
+ * Certificate errors a user may accept for a preview page, with the reason the
+ * prompt shows. Electron denies every other error.
+ */
+const OVERRIDABLE_CERTIFICATE_ERRORS: ReadonlyMap<string, string> = new Map([
+  ["net::ERR_CERT_AUTHORITY_INVALID", "No trusted authority issued this certificate."],
+  ["net::ERR_CERT_COMMON_NAME_INVALID", "This certificate is not for this address."],
+  ["net::ERR_CERT_DATE_INVALID", "This certificate has expired or is not valid yet."],
+]);
+
+/**
+ * The origin a certificate exception covers. A `wss:` socket uses the same TLS
+ * endpoint as the page, so it shares the `https:` origin.
+ */
+const certificateOrigin = (rawUrl: string): string | null => {
+  try {
+    const url = new URL(rawUrl);
+    return url.protocol === "https:" || url.protocol === "wss:" ? `https://${url.host}` : null;
+  } catch {
+    return null;
+  }
+};
+
+const MAX_PROMPT_CERTIFICATE_NAME_LENGTH = 120;
+
+/**
+ * The server chooses its certificate names, so they cannot add lines or
+ * control characters to the prompt.
+ */
+const promptCertificateName = (name: string): string => {
+  const flat = name.replace(/[\p{Cc}\p{Cf}\s]+/gu, " ").trim();
+  if (flat.length === 0) return "Unknown";
+  return flat.length > MAX_PROMPT_CERTIFICATE_NAME_LENGTH
+    ? `${flat.slice(0, MAX_PROMPT_CERTIFICATE_NAME_LENGTH)}…`
+    : flat;
+};
+
+const promptCertificateDate = (seconds: number): string =>
+  Option.match(DateTime.make(seconds * 1000), {
+    onNone: () => "unknown",
+    onSome: DateTime.formatIsoDateUtc,
+  });
+
+/** A tab that waits for the user's decision on a certificate. */
+interface CertificateWaiter {
+  readonly callback: (trusted: boolean) => void;
+  /** Removes the listeners that drop this waiter when its navigation goes away. */
+  readonly release: () => void;
+}
+
+/** One open certificate prompt. Tabs that hit the same error share it. */
+interface CertificatePrompt {
+  /** The exceptions of the Session the prompt is for. */
+  readonly exceptions: Set<string>;
+  readonly exception: string;
+  readonly dialog: AbortController;
+  readonly waiters: Set<CertificateWaiter>;
+}
+
 export class BrowserSessionPartitionDerivationError extends Schema.TaggedError<BrowserSessionPartitionDerivationError>()(
   "BrowserSessionPartitionDerivationError",
   {
@@ -109,11 +171,15 @@ export class BrowserSessionStorageClearError extends Schema.TaggedError<BrowserS
   "BrowserSessionStorageClearError",
   {
     partition: Schema.String,
+    /** Set when storage was cleared and only closing the open connections failed. */
+    operation: Schema.optional(Schema.Literal("closeConnections")),
     cause: Schema.Defect(),
   },
 ) {
   override get message(): string {
-    return `Failed to clear desktop preview browser storage for partition ${this.partition}.`;
+    return this.operation === "closeConnections"
+      ? `Cleared desktop preview browser storage for partition ${this.partition}, but failed to close its open connections.`
+      : `Failed to clear desktop preview browser storage for partition ${this.partition}.`;
   }
 }
 
@@ -214,6 +280,7 @@ const previewHostWindow = (guest: WebContents | null): BrowserWindow | undefined
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* BrowserSessionMake() {
   const crypto = yield* Crypto.Crypto;
+  const electronApp = yield* ElectronApp.ElectronApp;
   const electronDialog = yield* ElectronDialog.ElectronDialog;
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
   // One prompt at a time, so a page cannot stack dialogs by looping a deep link.
@@ -262,6 +329,159 @@ export const make = Effect.gen(function* BrowserSessionMake() {
         ),
     );
   };
+
+  /**
+   * The preview Sessions this service created, each with the certificate
+   * exceptions the user accepted in it. An exception is
+   * `origin fingerprint error`. It lasts until the profile's cookies are
+   * cleared or the app quits. Electron has no Chromium SSL host state store, so
+   * without this map a reload would prompt again and page resources would fail.
+   */
+  const certificateExceptions = new WeakMap<Session, Set<string>>();
+  const certificatePrompts = new Set<CertificatePrompt>();
+  /**
+   * Resolves every waiting callback once. A prompt closes when its last tab
+   * leaves, so a late answer finds the prompt gone and trusts nothing.
+   */
+  const settleCertificatePrompt = (prompt: CertificatePrompt, trusted: boolean) => {
+    if (!certificatePrompts.delete(prompt)) return;
+    if (trusted) prompt.exceptions.add(prompt.exception);
+    for (const waiter of prompt.waiters) {
+      waiter.release();
+      waiter.callback(trusted);
+    }
+    prompt.waiters.clear();
+  };
+  const cancelCertificatePrompt = (prompt: CertificatePrompt) => {
+    prompt.dialog.abort();
+    settleCertificatePrompt(prompt, false);
+  };
+  const dropCertificateWaiter = (prompt: CertificatePrompt, waiter: CertificateWaiter) => {
+    if (!prompt.waiters.delete(waiter)) return;
+    waiter.release();
+    waiter.callback(false);
+    if (prompt.waiters.size === 0) cancelCertificatePrompt(prompt);
+  };
+  /**
+   * Holds the navigation until the user decides. Closing the tab or starting a
+   * new page in it denies the waiting navigation.
+   */
+  const confirmCertificate = (
+    contents: WebContents,
+    exceptions: Set<string>,
+    exception: string,
+    details: {
+      readonly origin: string;
+      readonly reason: string;
+      readonly certificate: Certificate;
+    },
+    callback: (trusted: boolean) => void,
+  ): void => {
+    const shared = [...certificatePrompts].find(
+      (prompt) => prompt.exceptions === exceptions && prompt.exception === exception,
+    );
+    const prompt: CertificatePrompt = shared ?? {
+      exceptions,
+      exception,
+      dialog: new AbortController(),
+      waiters: new Set(),
+    };
+    const drop = () => dropCertificateWaiter(prompt, waiter);
+    const navigationStarted = (
+      event: Electron.Event<Electron.WebContentsDidStartNavigationEventParams>,
+    ) => {
+      if (event.isMainFrame && !event.isSameDocument) drop();
+    };
+    const waiter: CertificateWaiter = {
+      callback,
+      release: () => {
+        contents.off("destroyed", drop);
+        contents.off("did-start-navigation", navigationStarted);
+      },
+    };
+    contents.on("destroyed", drop);
+    contents.on("did-start-navigation", navigationStarted);
+    prompt.waiters.add(waiter);
+    if (shared !== undefined) return;
+
+    certificatePrompts.add(prompt);
+    const { certificate } = details;
+    runFork(
+      electronDialog
+        .showMessageBox(
+          {
+            type: "warning",
+            buttons: ["Continue", "Cancel"],
+            defaultId: 1,
+            cancelId: 1,
+            noLink: true,
+            message: `The certificate for ${details.origin} is not trusted.`,
+            detail: [
+              details.reason,
+              "",
+              "Continue only if you know the device at this address. If you continue, this browser profile trusts this certificate for this site until you clear its cookies or quit T3 Code.",
+              "",
+              `Subject: ${promptCertificateName(certificate.subjectName)}`,
+              `Issuer: ${promptCertificateName(certificate.issuerName)}`,
+              `Valid: ${promptCertificateDate(certificate.validStart)} to ${promptCertificateDate(certificate.validExpiry)}`,
+              `Fingerprint: ${certificate.fingerprint}`,
+            ].join("\n"),
+            signal: prompt.dialog.signal,
+          },
+          previewHostWindow(contents),
+        )
+        .pipe(
+          Effect.map(({ response }) => response === 0),
+          Effect.orElseSucceed(() => false),
+          Effect.flatMap((trusted) => Effect.sync(() => settleCertificatePrompt(prompt, trusted))),
+          Effect.onInterrupt(() => Effect.sync(() => cancelCertificatePrompt(prompt))),
+        ),
+    );
+  };
+  // Registered on `app` when the service starts, so a tab's first request is
+  // covered before the renderer registers its webview. Errors from other
+  // Sessions return without `preventDefault`, which keeps Electron's denial.
+  yield* electronApp.on(
+    "certificate-error",
+    (
+      event: Electron.Event,
+      contents: WebContents,
+      url: string,
+      error: string,
+      certificate: Certificate,
+      callback: (trusted: boolean) => void,
+      isMainFrame: boolean,
+    ) => {
+      if (contents.isDestroyed()) return;
+      const exceptions = certificateExceptions.get(contents.session);
+      const origin = certificateOrigin(url);
+      if (exceptions === undefined || origin === null) return;
+      const exception = `${origin} ${certificate.fingerprint} ${error}`;
+      if (exceptions.has(exception)) {
+        event.preventDefault();
+        callback(true);
+        return;
+      }
+      // Only a page navigation asks. A page resource with a certificate the
+      // user has not accepted stays blocked.
+      const reason = OVERRIDABLE_CERTIFICATE_ERRORS.get(error);
+      if (!isMainFrame || reason === undefined) return;
+      event.preventDefault();
+      confirmCertificate(
+        contents,
+        exceptions,
+        exception,
+        { origin, reason, certificate },
+        callback,
+      );
+    },
+  );
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      for (const prompt of certificatePrompts) cancelCertificatePrompt(prompt);
+    }),
+  );
+
   const sessionsRef = yield* SynchronizedRef.make<ReadonlyMap<string, Session>>(new Map());
 
   const getPartition = Effect.fn("BrowserSession.getPartition")(function* (
@@ -319,6 +539,7 @@ export const make = Effect.gen(function* BrowserSessionMake() {
           browserSession.setPermissionCheckHandler((_webContents, permission) =>
             ALLOWED_PREVIEW_PERMISSIONS.has(permission),
           );
+          certificateExceptions.set(browserSession, new Set());
           const next = new Map(sessions);
           next.set(partition, browserSession);
           return [browserSession, next] as const;
@@ -340,21 +561,52 @@ export const make = Effect.gen(function* BrowserSessionMake() {
       partition.startsWith(PREVIEW_EPHEMERAL_PARTITION_PREFIX),
     getSession,
     clearCookies: Effect.fn("BrowserSession.clearCookies")(function* (partitions?) {
-      const sessions = yield* SynchronizedRef.get(sessionsRef);
+      const selected = selectSessions(yield* SynchronizedRef.get(sessionsRef), partitions);
+      // Certificate exceptions are site data. Drop them first, so a failed
+      // storage clear cannot leave them in place.
+      for (const [, browserSession] of selected) {
+        const exceptions = certificateExceptions.get(browserSession);
+        if (exceptions === undefined) continue;
+        exceptions.clear();
+        for (const prompt of certificatePrompts) {
+          if (prompt.exceptions === exceptions) cancelCertificatePrompt(prompt);
+        }
+      }
       yield* Effect.forEach(
-        selectSessions(sessions, partitions),
+        selected,
         ([partition, browserSession]) =>
-          Effect.tryPromise({
-            try: () =>
-              browserSession.clearStorageData({
-                storages: ["cookies", "localstorage", "indexdb", "serviceworkers"],
-              }),
-            catch: (cause) =>
-              new BrowserSessionStorageClearError({
-                partition,
-                cause,
-              }),
-          }),
+          // Run both, so a failed close still clears storage. A storage failure
+          // is the one to report when both fail.
+          Effect.promise(() =>
+            Promise.allSettled([
+              (async () => {
+                // Retry closing connections even after a previous clear dropped the exceptions.
+                await browserSession.closeAllConnections();
+              })(),
+              (async () =>
+                browserSession.clearStorageData({
+                  storages: ["cookies", "localstorage", "indexdb", "serviceworkers"],
+                }))(),
+            ]),
+          ).pipe(
+            Effect.flatMap(([connections, storage]) => {
+              if (storage.status === "rejected") {
+                return Effect.fail(
+                  new BrowserSessionStorageClearError({ partition, cause: storage.reason }),
+                );
+              }
+              if (connections.status === "rejected") {
+                return Effect.fail(
+                  new BrowserSessionStorageClearError({
+                    partition,
+                    operation: "closeConnections",
+                    cause: connections.reason,
+                  }),
+                );
+              }
+              return Effect.void;
+            }),
+          ),
         { concurrency: "unbounded", discard: true },
       );
     }),
