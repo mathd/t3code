@@ -536,7 +536,16 @@ export function PreviewView({
           clearCookies: () =>
             void previewBridge
               ?.clearCookies(threadRef.environmentId, activeProfileId)
-              .catch(() => undefined),
+              .catch((error) => {
+                toastManager.add({
+                  type: "error",
+                  title: `Could not clear ${activeProfileName}'s data`,
+                  description:
+                    error instanceof Error
+                      ? `${error.message} Certificate approvals may still be saved. Try again.`
+                      : "Certificate approvals may still be saved. Try again.",
+                });
+              }),
           clearCache: () =>
             void previewBridge
               ?.clearCache(threadRef.environmentId, activeProfileId)
