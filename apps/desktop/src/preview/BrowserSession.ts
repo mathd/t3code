@@ -276,6 +276,10 @@ export class BrowserSession extends Context.Service<
     readonly clearCookies: (
       partitions?: ReadonlyArray<string>,
     ) => Effect.Effect<void, BrowserSessionStorageClearError>;
+    /** Clears a managed tab's cookies and certificate approvals, leaving its other storage. */
+    readonly clearTabCookies: (
+      contents: WebContents,
+    ) => Effect.Effect<boolean, BrowserSessionStorageClearError>;
     readonly clearCache: (
       partitions?: ReadonlyArray<string>,
     ) => Effect.Effect<void, BrowserSessionCacheClearError>;
@@ -554,7 +558,7 @@ export const make = Effect.gen(function* BrowserSessionMake() {
         .showMessageBox(
           {
             type: "warning",
-            buttons: ["Continue", "Cancel"],
+            buttons: [trust.file === null ? "Trust Until Quit" : "Trust and Remember", "Cancel"],
             defaultId: 1,
             cancelId: 1,
             noLink: true,
@@ -563,8 +567,8 @@ export const make = Effect.gen(function* BrowserSessionMake() {
               details.reason,
               "",
               trust.file === null
-                ? "Continue only if you know the device at this address. If you continue, incognito tabs trust this certificate for this site until you quit T3 Code or clear their cookies."
-                : "Continue only if you know the device at this address. If you continue, this browser profile trusts this certificate for this site until you clear the profile's cookies. The approval stays after you restart T3 Code.",
+                ? "Trust this certificate only if you know the device at this address. Incognito tabs trust it for this site until you quit T3 Code or clear their cookies."
+                : "Trust this certificate only if you know the device at this address. T3 Code saves your approval for this browser profile. The approval stays after you restart T3 Code. To remove it, clear the profile's cookies.",
               "",
               `Subject: ${promptCertificateName(certificate.subjectName)}`,
               `Issuer: ${promptCertificateName(certificate.issuerName)}`,
@@ -710,22 +714,22 @@ export const make = Effect.gen(function* BrowserSessionMake() {
   const removeSavedCertificateApprovals = (trust: CertificateTrust) =>
     trust.lock.withPermits(1)(
       Effect.suspend(() => {
-        trust.approvals.clear();
         return trust.file === null ? Effect.void : fs.remove(trust.file, { force: true });
       }),
     );
   /** Clears one Session's site data. Returns the failure to report, if any. */
-  const clearSessionCookies = (partition: string, browserSession: Session) => {
+  const clearSessionCookies = (
+    partition: string,
+    browserSession: Session,
+    storages: NonNullable<Electron.ClearStorageDataOptions["storages"]>,
+  ) => {
     const trust = certificateTrust.get(browserSession);
     // Run all three, so one failure does not stop the others. In this order,
     // the first failure is the one to report.
     return Effect.forEach(
       [
         Effect.tryPromise({
-          try: () =>
-            browserSession.clearStorageData({
-              storages: ["cookies", "localstorage", "indexdb", "serviceworkers"],
-            }),
+          try: () => browserSession.clearStorageData({ storages }),
           catch: (cause) => new BrowserSessionStorageClearError({ partition, cause }),
         }),
         // Retry the removal even after a previous clear emptied the approvals in memory.
@@ -755,6 +759,41 @@ export const make = Effect.gen(function* BrowserSessionMake() {
     ).pipe(Effect.map((results) => results.find(Result.isFailure)?.failure));
   };
 
+  const clearSessions = Effect.fn("BrowserSession.clearSessions")(function* (
+    selected: ReadonlyArray<readonly [string, Session]>,
+    storages: NonNullable<Electron.ClearStorageDataOptions["storages"]>,
+  ) {
+    const trusts = selected.flatMap(([, browserSession]) => {
+      const trust = certificateTrust.get(browserSession);
+      return trust === undefined ? [] : [trust];
+    });
+    const failures = yield* Effect.acquireUseRelease(
+      // Certificate approvals are site data. Drop them from memory first, so
+      // a failed clear cannot leave them in place.
+      Effect.sync(() => {
+        for (const trust of trusts) {
+          trust.clearing += 1;
+          trust.approvals.clear();
+          for (const prompt of certificatePrompts) {
+            if (prompt.trust === trust) cancelCertificatePrompt(prompt);
+          }
+        }
+      }),
+      () =>
+        Effect.forEach(
+          selected,
+          ([partition, browserSession]) => clearSessionCookies(partition, browserSession, storages),
+          { concurrency: "unbounded" },
+        ),
+      () =>
+        Effect.sync(() => {
+          for (const trust of trusts) trust.clearing -= 1;
+        }),
+    );
+    const failure = failures.find((error) => error !== undefined);
+    if (failure !== undefined) return yield* failure;
+  });
+
   return BrowserSession.of({
     getPartition,
     isPartition: (partition) =>
@@ -762,36 +801,39 @@ export const make = Effect.gen(function* BrowserSessionMake() {
       partition.startsWith(PREVIEW_EPHEMERAL_PARTITION_PREFIX),
     getSession,
     clearCookies: Effect.fn("BrowserSession.clearCookies")(function* (partitions?) {
-      const selected = selectSessions(yield* SynchronizedRef.get(sessionsRef), partitions);
-      const trusts = selected.flatMap(([, browserSession]) => {
-        const trust = certificateTrust.get(browserSession);
-        return trust === undefined ? [] : [trust];
-      });
-      const failures = yield* Effect.acquireUseRelease(
-        // Certificate approvals are site data. Drop them from memory first, so
-        // a failed clear cannot leave them in place.
-        Effect.sync(() => {
-          for (const trust of trusts) {
-            trust.clearing += 1;
-            trust.approvals.clear();
-            for (const prompt of certificatePrompts) {
-              if (prompt.trust === trust) cancelCertificatePrompt(prompt);
-            }
-          }
-        }),
-        () =>
-          Effect.forEach(
-            selected,
-            ([partition, browserSession]) => clearSessionCookies(partition, browserSession),
-            { concurrency: "unbounded" },
-          ),
-        () =>
-          Effect.sync(() => {
-            for (const trust of trusts) trust.clearing -= 1;
-          }),
+      yield* clearSessions(selectSessions(yield* SynchronizedRef.get(sessionsRef), partitions), [
+        "cookies",
+        "localstorage",
+        "indexdb",
+        "serviceworkers",
+      ]);
+    }),
+    clearTabCookies: Effect.fn("BrowserSession.clearTabCookies")(function* (contents) {
+      const selected = [...(yield* SynchronizedRef.get(sessionsRef))].filter(
+        ([, browserSession]) => browserSession === contents.session,
       );
-      const failure = failures.find((error) => error !== undefined);
-      if (failure !== undefined) return yield* failure;
+      if (selected.length === 0) return false;
+      yield* clearSessions(selected, ["cookies"]).pipe(
+        Effect.tapError(() =>
+          Effect.sync(() => {
+            runFork(
+              electronDialog
+                .showMessageBox(
+                  {
+                    type: "error",
+                    buttons: ["OK"],
+                    message: "T3 Code could not clear this profile's cookies.",
+                    detail:
+                      "Some data can stay, such as certificates that you accepted. Try again. If the problem continues, make sure T3 Code can write to its data folder.",
+                  },
+                  certificateDialogOwner(contents),
+                )
+                .pipe(Effect.ignore({ log: true })),
+            );
+          }),
+        ),
+      );
+      return true;
     }),
     clearCache: Effect.fn("BrowserSession.clearCache")(function* (partitions?) {
       const sessions = yield* SynchronizedRef.get(sessionsRef);

@@ -24,6 +24,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { createCdpRelayConnection, type CdpRelayConnection } from "./CdpRelay.ts";
+import * as BrowserSession from "./BrowserSession.ts";
 
 const encodeEvent = Schema.encodeSync(Schema.fromJsonString(DesktopBrowserEvent));
 const decodeCommand = Schema.decodeUnknownOption(Schema.fromJsonString(DesktopBrowserCommand));
@@ -97,6 +98,7 @@ export class DesktopBrowserHost extends Context.Service<
 >()("@t3tools/desktop/preview/DesktopBrowserHost") {}
 
 export const make = Effect.gen(function* () {
+  const browserSession = yield* BrowserSession.BrowserSession;
   const outbox = yield* PubSub.unbounded<DesktopBrowserEventType>();
   const pointers = yield* PubSub.sliding<{
     readonly key: DesktopBrowserTabKey;
@@ -104,7 +106,9 @@ export const make = Effect.gen(function* () {
     readonly x: number;
     readonly y: number;
   }>(16);
-  const runFork = Effect.runForkWith(yield* Effect.context<never>());
+  const context = yield* Effect.context<never>();
+  const runFork = Effect.runForkWith(context);
+  const runPromise = Effect.runPromiseWith(context);
   const tabs = new Map<string, AttachedTab>();
   const emit = (event: DesktopBrowserEventType) => runFork(PubSub.publish(outbox, event));
 
@@ -113,10 +117,17 @@ export const make = Effect.gen(function* () {
     const { webContents, debugger: debuggee } = tab.debuggee;
     const relay: CdpRelayConnection = createCdpRelayConnection(
       {
-        send: (method, params, sessionId) =>
-          sessionId === undefined
+        send: async (method, params, sessionId) => {
+          if (
+            method === "Network.clearBrowserCookies" &&
+            (await runPromise(browserSession.clearTabCookies(webContents)))
+          ) {
+            return {};
+          }
+          return sessionId === undefined
             ? debuggee.sendCommand(method, params)
-            : debuggee.sendCommand(method, params, sessionId),
+            : debuggee.sendCommand(method, params, sessionId);
+        },
         targetId: () =>
           debuggee
             .sendCommand("Target.getTargetInfo")

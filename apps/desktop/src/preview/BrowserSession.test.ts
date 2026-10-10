@@ -5,6 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { assert, describe, it } from "@effect/vitest";
+import { DesktopBrowserEvent } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
@@ -17,7 +18,22 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Scope from "effect/Scope";
+import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import { afterEach, beforeEach, vi } from "vite-plus/test";
+
+const decodeDesktopBrowserEvent = Schema.decodeEffect(Schema.fromJsonString(DesktopBrowserEvent));
+const decodeCookieClearReply = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Union([
+      Schema.Struct({ id: Schema.Number, result: Schema.Struct({}) }),
+      Schema.Struct({
+        id: Schema.Number,
+        error: Schema.Struct({ code: Schema.Number, message: Schema.String }),
+      }),
+    ]),
+  ),
+);
 
 const { fromPartition, sessions } = vi.hoisted(() => ({
   fromPartition: vi.fn(),
@@ -62,6 +78,7 @@ vi.mock("electron", () => ({
 import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as BrowserSession from "./BrowserSession.ts";
+import * as DesktopBrowserHost from "./DesktopBrowserHost.ts";
 
 const { showMessageBox } = vi.hoisted(() => ({
   showMessageBox: vi.fn<
@@ -610,21 +627,12 @@ describe("BrowserSession", () => {
     { platform: "darwin", owner: hostWindow, label: "on the host window" },
   ] as const)("settles $platform certificate prompts shown $label", ({ platform, owner }) =>
     Effect.gen(function* () {
-      const browserSessions = yield* BrowserSession.BrowserSession;
-      const partition = yield* browserSessions.getPartition("scope-a");
-      yield* browserSessions.getSession("scope-a");
       fromWebContents.mockImplementation((webContents) =>
         webContents === host ? hostWindow : null,
       );
-      const tab = makeTab(sessions.get(partition));
-
-      const accepted = certificateError(tab, { url: "https://10.99.0.10/" });
-      yield* answer(0, CONTINUE);
-      assert.isTrue(yield* accepted.trusted);
-
-      const cancelled = certificateError(tab, { url: "https://10.99.0.10:8443/" });
-      yield* answer(1, CANCEL);
-      assert.isFalse(yield* cancelled.trusted);
+      const tab = yield* openTab("scope-a");
+      assert.isTrue(yield* accept(tab, { url: "https://10.99.0.10/" }));
+      yield* assertPrompts(tab, { url: "https://10.99.0.10:8443/" });
 
       const left = certificateError(tab, { url: "https://10.99.0.10:9443/" });
       tab.startNavigation({ isMainFrame: true, isSameDocument: false });
@@ -642,158 +650,57 @@ describe("BrowserSession", () => {
     }).pipe(Effect.provide(layerCertificatesOn(platform))),
   );
 
-  it.effect(
-    "reuses an accepted certificate only for its profile, origin, certificate, and error",
-    () =>
-      Effect.gen(function* () {
-        const browserSessions = yield* BrowserSession.BrowserSession;
-        const partition = yield* browserSessions.getPartition("env::a", true, "profile");
-        const otherPartition = yield* browserSessions.getPartition("env::b", true, "profile");
-        yield* browserSessions.getSession("env::a", true, "profile");
-        yield* browserSessions.getSession("env::b", true, "profile");
-        const tab = makeTab(sessions.get(partition));
-
-        const accepted = certificateError(tab, { url: "https://10.99.0.10/" });
-        yield* answer(0, CONTINUE);
-        assert.isTrue(yield* accepted.trusted);
-
-        // A reload, page resources, and the controller's WebSocket reuse it.
-        for (const input of [
-          { url: "https://10.99.0.10/" },
-          { url: "https://10.99.0.10:443/app.js", isMainFrame: false },
-          { url: "wss://10.99.0.10/proxy/network/wss/s/default/events", isMainFrame: false },
-        ]) {
-          assertTrustedWithoutPrompt(certificateError(tab, input), input.url);
-        }
-        assert.strictEqual(prompts.length, 1);
-
-        // Resources with another certificate or origin stay blocked.
-        assertLeftToElectron(
-          certificateError(tab, {
-            url: "https://10.99.0.10/app.js",
-            certificate: renewedCertificate,
-            isMainFrame: false,
-          }),
-        );
-        assertLeftToElectron(
-          certificateError(tab, { url: "https://10.99.0.10:8443/app.js", isMainFrame: false }),
-        );
-
-        // A new certificate, a new error, another origin, or another profile asks again.
-        for (const [contents, input] of [
-          [tab, { url: "https://10.99.0.10/", certificate: renewedCertificate }],
-          [tab, { url: "https://10.99.0.10/", error: "net::ERR_CERT_DATE_INVALID" }],
-          [tab, { url: "https://10.99.0.10:8443/" }],
-          [makeTab(sessions.get(otherPartition)), { url: "https://10.99.0.10/" }],
-        ] as const) {
-          const opened = prompts.length;
-          const asked = certificateError(contents, input);
-          assert.strictEqual(prompts.length, opened + 1, input.url);
-          yield* answer(opened, CANCEL);
-          assert.isFalse(yield* asked.trusted);
-        }
-      }).pipe(Effect.provide(layerCertificates)),
-  );
-
-  it.effect("shares one prompt between tabs and denies the tabs that close or leave", () =>
+  it.effect("shares a certificate prompt and trusts only the tab that stays", () =>
     Effect.gen(function* () {
-      const browserSessions = yield* BrowserSession.BrowserSession;
-      const partition = yield* browserSessions.getPartition("scope-a");
-      yield* browserSessions.getSession("scope-a");
-      const closing = makeTab(sessions.get(partition));
-      const leaving = makeTab(sessions.get(partition));
-
+      const closing = yield* openTab("scope-a");
+      const staying = yield* openTab("scope-a");
       const closed = certificateError(closing, { url: "https://10.99.0.10/" });
-      const left = certificateError(leaving, { url: "https://10.99.0.10/login" });
+      const accepted = certificateError(staying, { url: "https://10.99.0.10/login" });
       assert.strictEqual(prompts.length, 1);
       const prompt = prompts[0]!;
 
       closing.close();
       assert.deepEqual(closed.callback.mock.calls, [[false]]);
-
       // In-page and subframe navigations do not replace the waiting page.
-      leaving.startNavigation({ isMainFrame: true, isSameDocument: true });
-      leaving.startNavigation({ isMainFrame: false, isSameDocument: false });
-      assert.strictEqual(left.callback.mock.calls.length, 0);
+      staying.startNavigation({ isMainFrame: true, isSameDocument: true });
+      staying.startNavigation({ isMainFrame: false, isSameDocument: false });
+      assert.strictEqual(accepted.callback.mock.calls.length, 0);
       assert.isFalse(prompt.options.signal?.aborted);
 
-      leaving.startNavigation({ isMainFrame: true, isSameDocument: false });
-      assert.deepEqual(left.callback.mock.calls, [[false]]);
-      assert.isTrue(prompt.options.signal?.aborted);
-
-      // Continue after every tab has left creates no exception.
       yield* answer(0, CONTINUE);
-      yield* Deferred.await(prompt.answered);
-      const next = certificateError(leaving, { url: "https://10.99.0.10/" });
-      assert.strictEqual(prompts.length, 2);
-      yield* answer(1, CANCEL);
-      assert.isFalse(yield* next.trusted);
+      assert.isTrue(yield* accepted.trusted);
+      assert.deepEqual(accepted.callback.mock.calls, [[true]]);
       assert.deepEqual(closed.callback.mock.calls, [[false]]);
-      assert.deepEqual(left.callback.mock.calls, [[false]]);
+      assert.strictEqual(staying.listenerCount("destroyed"), 0);
+      assert.strictEqual(staying.listenerCount("did-start-navigation"), 0);
     }).pipe(Effect.provide(layerCertificates)),
   );
 
-  it.effect("drops a profile's certificate exceptions when its cookies are cleared", () =>
+  it.effect("revokes accepted and pending certificates only in the cleared profile", () =>
     Effect.gen(function* () {
-      const browserSessions = yield* BrowserSession.BrowserSession;
-      const cleared = yield* browserSessions.getPartition("scope-a");
-      const kept = yield* browserSessions.getPartition("scope-b");
-      yield* browserSessions.getSession("scope-a");
-      yield* browserSessions.getSession("scope-b");
-      const clearedTab = makeTab(sessions.get(cleared));
-      const keptTab = makeTab(sessions.get(kept));
-      for (const [index, tab] of [clearedTab, keptTab].entries()) {
-        const accepted = certificateError(tab, { url: "https://10.99.0.10/" });
-        yield* answer(index, CONTINUE);
-        assert.isTrue(yield* accepted.trusted);
-      }
+      const { browserSessions, cleared, clearedSession, clearedTab, keptSession, keptTab } =
+        yield* makeTrustedProfiles;
+      const cancelled = certificateError(clearedTab, { url: "https://10.99.0.11/" });
+      const retained = certificateError(keptTab, { url: "https://10.99.0.11/" });
 
       yield* browserSessions.clearCookies([cleared]);
 
-      assert.strictEqual(sessions.get(cleared)?.closeAllConnections.mock.calls.length, 1);
-      assert.strictEqual(sessions.get(kept)?.closeAllConnections.mock.calls.length, 0);
-      assertTrustedWithoutPrompt(certificateError(keptTab, { url: "https://10.99.0.10/" }));
-      assertLeftToElectron(
-        certificateError(clearedTab, { url: "https://10.99.0.10/app.js", isMainFrame: false }),
-      );
-      const again = certificateError(clearedTab, { url: "https://10.99.0.10/" });
-      assert.strictEqual(prompts.length, 3);
-      yield* answer(2, CANCEL);
-      assert.isFalse(yield* again.trusted);
-    }).pipe(Effect.provide(layerCertificates)),
-  );
-
-  it.effect("cancels pending certificate approvals when their profile is cleared", () =>
-    Effect.gen(function* () {
-      const browserSessions = yield* BrowserSession.BrowserSession;
-      const cleared = yield* browserSessions.getPartition("scope-a");
-      const kept = yield* browserSessions.getPartition("scope-b");
-      yield* browserSessions.getSession("scope-a");
-      yield* browserSessions.getSession("scope-b");
-      const clearedTab = makeTab(sessions.get(cleared));
-      const keptTab = makeTab(sessions.get(kept));
-      const cancelled = certificateError(clearedTab, { url: "https://10.99.0.10/" });
-      const retained = certificateError(keptTab, { url: "https://10.99.0.10/" });
-
-      yield* browserSessions.clearCookies([cleared]);
-
+      assert.strictEqual(clearedSession.closeAllConnections.mock.calls.length, 1);
+      assert.strictEqual(keptSession.closeAllConnections.mock.calls.length, 0);
       assert.isFalse(yield* cancelled.trusted);
-      assert.isTrue(prompts[0]!.options.signal?.aborted);
-      assert.isFalse(prompts[1]!.options.signal?.aborted);
+      assert.isTrue(prompts[2]!.options.signal?.aborted);
+      assert.isFalse(prompts[3]!.options.signal?.aborted);
       assert.strictEqual(retained.callback.mock.calls.length, 0);
-      yield* answer(0, CONTINUE);
-      yield* Deferred.await(prompts[0]!.answered);
+      yield* answer(2, CONTINUE);
+      yield* Deferred.await(prompts[2]!.answered);
       assert.deepEqual(cancelled.callback.mock.calls, [[false]]);
-      yield* answer(1, CONTINUE);
+      yield* answer(3, CONTINUE);
       assert.isTrue(yield* retained.trusted);
       assertTrustedWithoutPrompt(certificateError(keptTab, { url: "https://10.99.0.10/" }));
       assertLeftToElectron(
         certificateError(clearedTab, { url: "https://10.99.0.10/app.js", isMainFrame: false }),
       );
-      const again = certificateError(clearedTab, { url: "https://10.99.0.10/" });
-      assert.strictEqual(prompts.length, 3);
-      yield* answer(2, CANCEL);
-      assert.isFalse(yield* again.trusted);
+      yield* assertPrompts(clearedTab, { url: "https://10.99.0.10/" });
     }).pipe(Effect.provide(layerCertificates)),
   );
 
@@ -810,11 +717,8 @@ describe("BrowserSession", () => {
     assert.isDefined(keptSession);
     const clearedTab = makeTab(clearedSession);
     const keptTab = makeTab(keptSession);
-    for (const [index, tab] of [clearedTab, keptTab].entries()) {
-      const accepted = certificateError(tab, { url: "https://10.99.0.10/" });
-      yield* answer(index, CONTINUE);
-      assert.isTrue(yield* accepted.trusted);
-      assert.deepEqual(accepted.callback.mock.calls, [[true]]);
+    for (const tab of [clearedTab, keptTab]) {
+      assert.isTrue(yield* accept(tab, { url: "https://10.99.0.10/" }));
     }
     return { browserSessions, cleared, clearedSession, clearedTab, keptSession, keptTab };
   });
@@ -858,7 +762,10 @@ describe("BrowserSession", () => {
     }).pipe(Effect.provide(layerCertificates)),
   );
 
-  it.effect("drops accepted and pending certificate trust when the storage clear fails", () =>
+  it.effect.each([
+    { label: "storage fails", closeFails: false },
+    { label: "storage and connection cleanup fail", closeFails: true },
+  ])("drops accepted and pending certificate trust when $label", ({ closeFails }) =>
     Effect.gen(function* () {
       const { browserSessions, cleared, clearedSession, clearedTab, keptSession, keptTab } =
         yield* makeTrustedProfiles;
@@ -867,6 +774,11 @@ describe("BrowserSession", () => {
       assert.strictEqual(prompts.length, 4);
       const storageCause = new Error("storage clear failed");
       clearedSession.clearStorageData.mockImplementationOnce(() => Promise.reject(storageCause));
+      if (closeFails) {
+        clearedSession.closeAllConnections.mockImplementationOnce(() =>
+          Promise.reject(new Error("close failed")),
+        );
+      }
 
       const error = yield* browserSessions.clearCookies([cleared]).pipe(Effect.flip);
 
@@ -879,6 +791,7 @@ describe("BrowserSession", () => {
         `Failed to clear desktop preview browser storage for partition ${cleared}.`,
       );
       assert.strictEqual(clearedSession.closeAllConnections.mock.calls.length, 1);
+      assert.deepEqual(clearedSession.clearStorageData.mock.calls, [CLEARED_STORAGES]);
       assert.strictEqual(keptSession.clearStorageData.mock.calls.length, 0);
 
       assert.deepEqual(cancelled.callback.mock.calls, [[false]]);
@@ -898,32 +811,6 @@ describe("BrowserSession", () => {
       yield* answer(3, CONTINUE);
       assert.isTrue(yield* retained.trusted);
       assert.deepEqual(retained.callback.mock.calls, [[true]]);
-      assertTrustedWithoutPrompt(certificateError(keptTab, { url: "https://10.99.0.10/" }));
-    }).pipe(Effect.provide(layerCertificates)),
-  );
-
-  it.effect("reports the storage failure when closing connections also fails", () =>
-    Effect.gen(function* () {
-      const { browserSessions, cleared, clearedSession, keptSession, keptTab } =
-        yield* makeTrustedProfiles;
-      const storageCause = new Error("storage clear failed");
-      clearedSession.closeAllConnections.mockImplementationOnce(() =>
-        Promise.reject(new Error("close failed")),
-      );
-      clearedSession.clearStorageData.mockImplementationOnce(() => Promise.reject(storageCause));
-
-      const error = yield* browserSessions.clearCookies([cleared]).pipe(Effect.flip);
-
-      assert.instanceOf(error, BrowserSession.BrowserSessionStorageClearError);
-      assert.isUndefined(error.operation);
-      assert.strictEqual(error.cause, storageCause);
-      assert.equal(
-        error.message,
-        `Failed to clear desktop preview browser storage for partition ${cleared}.`,
-      );
-      assert.strictEqual(clearedSession.closeAllConnections.mock.calls.length, 1);
-      assert.deepEqual(clearedSession.clearStorageData.mock.calls, [CLEARED_STORAGES]);
-      assert.strictEqual(keptSession.closeAllConnections.mock.calls.length, 0);
       assertTrustedWithoutPrompt(certificateError(keptTab, { url: "https://10.99.0.10/" }));
     }).pipe(Effect.provide(layerCertificates)),
   );
@@ -957,14 +844,52 @@ describe("BrowserSession", () => {
   const page = { url: "https://10.99.0.10/" };
   const resource = { url: "https://10.99.0.10/app.js", isMainFrame: false };
 
+  /** Sends a cookie clear through the real desktop host and waits for its CDP reply. */
+  const sendCookieClear = Effect.fnUntraced(function* (tab: ReturnType<typeof makeTab>) {
+    const browserHost = yield* DesktopBrowserHost.make;
+    const key = { threadId: "thread-1", tabId: "tab-1" };
+    const debuggee = Object.assign(new NodeEvents.EventEmitter(), {
+      sendCommand: vi.fn(() => Promise.resolve({})),
+    });
+    browserHost.attach(key, {
+      webContents: Object.assign(tab, {
+        getURL: () => "https://10.99.0.10/",
+        getTitle: () => "UniFi",
+        getUserAgent: () => "Electron",
+      }) as unknown as Electron.WebContents,
+      debugger: debuggee as unknown as Electron.Debugger,
+    });
+    const reply = yield* browserHost.events.pipe(
+      Stream.mapEffect((line) => decodeDesktopBrowserEvent(new TextDecoder().decode(line))),
+      Stream.filter((event) => event.type === "cdp"),
+      Stream.take(1),
+      Stream.runCollect,
+      Effect.forkChild({ startImmediately: true }),
+    );
+    yield* browserHost.handleCommandLine(
+      JSON.stringify({
+        type: "cdp",
+        ...key,
+        message: JSON.stringify({
+          id: 1,
+          method: "Network.clearBrowserCookies",
+          sessionId: "t3-preview-page",
+        }),
+      }),
+    );
+    const [event] = yield* Fiber.join(reply);
+    assert.isDefined(event);
+    assert.strictEqual(event.type, "cdp");
+    if (event.type !== "cdp") return yield* Effect.die("Expected a CDP reply.");
+    const replyMessage = yield* decodeCookieClearReply(event.message);
+    return { reply: replyMessage, sendCommand: debuggee.sendCommand };
+  });
+
   it.effect("remembers an accepted certificate after a restart, only where it was accepted", () =>
     Effect.gen(function* () {
       yield* Effect.gen(function* () {
         assert.isTrue(yield* accept(yield* openTab("scope-a"), page));
-        assert.include(
-          prompts[0]!.options.detail,
-          "until you clear the profile's cookies. The approval stays after you restart T3 Code.",
-        );
+        assert.deepEqual(prompts[0]!.options.buttons, ["Trust and Remember", "Cancel"]);
       }).pipe(Effect.provide(layerCertificates));
 
       yield* Effect.gen(function* () {
@@ -978,6 +903,13 @@ describe("BrowserSession", () => {
           assertTrustedWithoutPrompt(certificateError(tab, input), input.url);
         }
         assert.strictEqual(prompts.length, 1);
+
+        assertLeftToElectron(
+          certificateError(tab, { ...resource, certificate: renewedCertificate }),
+        );
+        assertLeftToElectron(
+          certificateError(tab, { url: "https://10.99.0.10:8443/app.js", isMainFrame: false }),
+        );
 
         // A new certificate, a new error, another port, or another profile asks again.
         yield* assertPrompts(tab, { ...page, certificate: renewedCertificate });
@@ -993,10 +925,7 @@ describe("BrowserSession", () => {
       yield* Effect.gen(function* () {
         const tab = yield* openTab("scope-a", false);
         assert.isTrue(yield* accept(tab, page));
-        assert.include(
-          prompts[0]!.options.detail,
-          "incognito tabs trust this certificate for this site until you quit T3 Code or clear their cookies.",
-        );
+        assert.deepEqual(prompts[0]!.options.buttons, ["Trust Until Quit", "Cancel"]);
         assert.notInclude(prompts[0]!.options.detail, "restart");
         assertTrustedWithoutPrompt(certificateError(tab, resource));
       }).pipe(Effect.provide(layerCertificates));
@@ -1023,6 +952,84 @@ describe("BrowserSession", () => {
         yield* browserSessions.clearCookies([yield* browserSessions.getPartition("scope-a")]);
       }).pipe(Effect.provide(layerCertificates));
 
+      yield* Effect.gen(function* () {
+        yield* assertPrompts(yield* openTab("scope-a"), page);
+        assertTrustedWithoutPrompt(certificateError(yield* openTab("scope-b"), page));
+      }).pipe(Effect.provide(layerCertificates));
+    }),
+  );
+
+  it.effect("revokes native server tab approvals through a CDP cookie clear", () =>
+    Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        const { clearedSession, clearedTab, keptSession, keptTab } = yield* makeTrustedProfiles;
+        const pending = certificateError(clearedTab, { url: "https://10.99.0.11/" });
+        const { reply, sendCommand } = yield* sendCookieClear(clearedTab);
+        assert.deepEqual(reply, { id: 1, result: {} });
+        assert.strictEqual(sendCommand.mock.calls.length, 0);
+        assert.deepEqual(clearedSession.clearStorageData.mock.calls, [[{ storages: ["cookies"] }]]);
+        assert.strictEqual(clearedSession.closeAllConnections.mock.calls.length, 1);
+        assert.strictEqual(keptSession.clearStorageData.mock.calls.length, 0);
+        assert.strictEqual(keptSession.closeAllConnections.mock.calls.length, 0);
+
+        assertLeftToElectron(certificateError(clearedTab, resource));
+        assert.deepEqual([...pending.callback.mock.calls], [[false]]);
+        assert.isTrue(prompts[2]!.options.signal?.aborted);
+        yield* answer(2, CONTINUE);
+        yield* Deferred.await(prompts[2]!.answered);
+        yield* assertPrompts(clearedTab, page);
+        assertTrustedWithoutPrompt(certificateError(keptTab, page));
+      }).pipe(Effect.provide(layerCertificates));
+
+      yield* Effect.gen(function* () {
+        yield* assertPrompts(yield* openTab("scope-a"), page);
+        yield* assertPrompts(yield* openTab("scope-a"), { url: "https://10.99.0.11/" });
+        assertTrustedWithoutPrompt(certificateError(yield* openTab("scope-b"), page));
+      }).pipe(Effect.provide(layerCertificates));
+    }),
+  );
+
+  it.effect("reports a failed native cookie clear and removes saved trust on retry", () =>
+    Effect.gen(function* () {
+      const gate = makeFileGate("win32");
+      yield* Effect.gen(function* () {
+        const { cleared, clearedSession, clearedTab, keptTab } = yield* makeTrustedProfiles;
+        const removal = gate.hold("remove");
+        const clear = yield* sendCookieClear(clearedTab).pipe(
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Deferred.await(removal.entered);
+        yield* Deferred.fail(removal.release, fileFailure("remove"));
+        const { reply } = yield* Fiber.join(clear);
+        assert.isTrue("error" in reply);
+        if (!("error" in reply)) return;
+        assert.strictEqual(reply.error.code, -32000);
+        assert.strictEqual(
+          reply.error.message,
+          new BrowserSession.BrowserSessionStorageClearError({
+            partition: cleared,
+            operation: "certificateApprovals",
+            cause: fileFailure("remove"),
+          }).message,
+        );
+        yield* Deferred.await(promptOpened(2));
+        assert.strictEqual(prompts[2]!.options.type, "error");
+        assert.strictEqual(
+          prompts[2]!.options.message,
+          "T3 Code could not clear this profile's cookies.",
+        );
+        assert.isUndefined(prompts[2]!.owner);
+        assert.deepEqual(clearedSession.clearStorageData.mock.calls, [[{ storages: ["cookies"] }]]);
+        assert.strictEqual(clearedSession.closeAllConnections.mock.calls.length, 1);
+        assert.isTrue(NodeFS.existsSync(approvalsFileFor(cleared)));
+        assertLeftToElectron(certificateError(clearedTab, resource));
+        assertTrustedWithoutPrompt(certificateError(keptTab, page));
+        yield* answer(2, 0);
+        yield* Deferred.await(prompts[2]!.answered);
+
+        assert.deepEqual((yield* sendCookieClear(clearedTab)).reply, { id: 1, result: {} });
+        assert.isFalse(NodeFS.existsSync(approvalsFileFor(cleared)));
+      }).pipe(Effect.provide(gate.layer));
       yield* Effect.gen(function* () {
         yield* assertPrompts(yield* openTab("scope-a"), page);
         assertTrustedWithoutPrompt(certificateError(yield* openTab("scope-b"), page));
@@ -1057,19 +1064,28 @@ describe("BrowserSession", () => {
     },
   ])("uses a saved approval file only when it is valid: $label", ({ contents, valid = false }) =>
     Effect.gen(function* () {
+      const browserSessions = yield* BrowserSession.BrowserSession;
+      const file = approvalsFileFor(yield* browserSessions.getPartition("scope-a"));
+      NodeFS.mkdirSync(NodePath.dirname(file), { recursive: true });
+      NodeFS.writeFileSync(file, contents);
+      const tab = yield* openTab("scope-a");
+      if (valid) {
+        assertTrustedWithoutPrompt(certificateError(tab, page));
+      } else {
+        assertLeftToElectron(certificateError(tab, resource));
+        yield* assertPrompts(tab, page);
+      }
+    }).pipe(Effect.provide(layerCertificates)),
+  );
+
+  it.effect("replaces an invalid approval file when the user accepts, and remembers it", () =>
+    Effect.gen(function* () {
       yield* Effect.gen(function* () {
         const browserSessions = yield* BrowserSession.BrowserSession;
         const file = approvalsFileFor(yield* browserSessions.getPartition("scope-a"));
         NodeFS.mkdirSync(NodePath.dirname(file), { recursive: true });
-        NodeFS.writeFileSync(file, contents);
-        const tab = yield* openTab("scope-a");
-        if (valid) {
-          assertTrustedWithoutPrompt(certificateError(tab, page));
-          return;
-        }
-        assertLeftToElectron(certificateError(tab, resource));
-        // Accepting the prompt replaces the invalid file.
-        assert.isTrue(yield* accept(tab, page));
+        NodeFS.writeFileSync(file, "{");
+        assert.isTrue(yield* accept(yield* openTab("scope-a"), page));
       }).pipe(Effect.provide(layerCertificates));
 
       yield* Effect.gen(function* () {

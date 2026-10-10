@@ -540,10 +540,7 @@ export function PreviewView({
                 toastManager.add({
                   type: "error",
                   title: `Could not clear ${activeProfileName}'s data`,
-                  description:
-                    error instanceof Error
-                      ? `${error.message} Certificate approvals may still be saved. Try again.`
-                      : "Certificate approvals may still be saved. Try again.",
+                  description: error instanceof Error ? error.message : "An error occurred.",
                 });
               }),
           clearCache: () =>
