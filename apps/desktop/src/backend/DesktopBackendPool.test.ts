@@ -13,6 +13,7 @@ import * as DesktopObservability from "../app/DesktopObservability.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopTelemetryPublisher from "../telemetry/DesktopTelemetryPublisher.ts";
 import * as DesktopBrowserHost from "../preview/DesktopBrowserHost.ts";
+import * as BrowserSession from "../preview/BrowserSession.ts";
 import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
@@ -77,7 +78,9 @@ function layerPool(labelRef: Ref.Ref<string>): Layer.Layer<DesktopBackendPool.De
           updateCommits: Stream.empty,
           updateCancellations: Stream.empty,
         }),
-        DesktopBrowserHost.layer,
+        DesktopBrowserHost.layer.pipe(
+          Layer.provide(Layer.mock(BrowserSession.BrowserSession)({ isPartition: () => false })),
+        ),
         Layer.succeed(DesktopBackendConfiguration.DesktopBackendConfiguration, {
           resolvePrimary: Effect.die("unexpected primary config resolve"),
           resolvePrimaryLabel: Ref.get(labelRef),

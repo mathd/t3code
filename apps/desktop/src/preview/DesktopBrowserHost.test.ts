@@ -3,11 +3,17 @@ import { describe, expect, it } from "@effect/vitest";
 import { DesktopBrowserEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as NodeEvents from "node:events";
 
 import * as DesktopBrowserHost from "./DesktopBrowserHost.ts";
+import * as BrowserSession from "./BrowserSession.ts";
+
+const makeHost = DesktopBrowserHost.make.pipe(
+  Effect.provide(Layer.mock(BrowserSession.BrowserSession)({ isPartition: () => false })),
+);
 
 const decodeEvent = Schema.decodeUnknownSync(Schema.fromJsonString(DesktopBrowserEvent));
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -56,7 +62,7 @@ const takeEvents = (host: DesktopBrowserHost.DesktopBrowserHost["Service"], coun
 describe("DesktopBrowserHost", () => {
   it.effect("announces tabs already attached to a backend that starts later", () =>
     Effect.gen(function* () {
-      const host = yield* DesktopBrowserHost.make;
+      const host = yield* makeHost;
       host.attach(key, makeDebuggee().tab);
       // A restarted backend subscribes after the attach and still hears it.
       expect(yield* takeEvents(host, 1)).toEqual([{ type: "attached", ...key }]);
@@ -66,7 +72,7 @@ describe("DesktopBrowserHost", () => {
 
   it.effect("drops replies from a relay the server released", () =>
     Effect.gen(function* () {
-      const host = yield* DesktopBrowserHost.make;
+      const host = yield* makeHost;
       const debuggee = makeDebuggee();
       host.attach(key, debuggee.tab);
       const reader = yield* takeEvents(host, 2).pipe(Effect.forkScoped);
@@ -94,7 +100,7 @@ describe("DesktopBrowserHost", () => {
 
   it.effect("saves a server tab's download under its CDP guid where the server asked", () =>
     Effect.gen(function* () {
-      const host = yield* DesktopBrowserHost.make;
+      const host = yield* makeHost;
       const debuggee = makeDebuggee();
       host.attach(key, debuggee.tab);
       const paths: Array<string> = [];
@@ -122,7 +128,7 @@ describe("DesktopBrowserHost", () => {
 
   it.effect("tells a download the person clicked from one the agent's input started", () =>
     Effect.gen(function* () {
-      const host = yield* DesktopBrowserHost.make;
+      const host = yield* makeHost;
       const debuggee = makeDebuggee();
       host.attach(key, debuggee.tab);
       // Reading the page is not acting on it.

@@ -29,6 +29,7 @@ import * as DesktopBackendPool from "./DesktopBackendPool.ts";
 import * as DesktopObservability from "../app/DesktopObservability.ts";
 import * as DesktopTelemetryPublisher from "../telemetry/DesktopTelemetryPublisher.ts";
 import * as DesktopBrowserHost from "../preview/DesktopBrowserHost.ts";
+import * as BrowserSession from "../preview/BrowserSession.ts";
 import * as DesktopWslEnvironment from "../wsl/DesktopWslEnvironment.ts";
 
 const decodeDesktopBackendBootstrap = Schema.decodeEffect(
@@ -176,7 +177,9 @@ function makeTestInstance(input: MakeInstanceInput) {
       updateCancellations: Stream.empty,
       ...input.desktopTelemetryPublisher,
     }),
-    DesktopBrowserHost.layer,
+    DesktopBrowserHost.layer.pipe(
+      Layer.provide(Layer.mock(BrowserSession.BrowserSession)({ isPartition: () => false })),
+    ),
     DesktopWslEnvironment.layerTest(
       input.pruneRuntimes === undefined ? {} : { pruneRuntimes: input.pruneRuntimes },
     ),
