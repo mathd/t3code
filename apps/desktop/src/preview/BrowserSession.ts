@@ -1,5 +1,6 @@
 import type { Certificate, Session, WebContents } from "electron";
 import { BrowserWindow, session } from "electron";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -282,6 +283,7 @@ export const make = Effect.gen(function* BrowserSessionMake() {
   const crypto = yield* Crypto.Crypto;
   const electronApp = yield* ElectronApp.ElectronApp;
   const electronDialog = yield* ElectronDialog.ElectronDialog;
+  const platform = yield* HostProcess.Platform;
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
   // One prompt at a time, so a page cannot stack dialogs by looping a deep link.
   let externalPromptOpen = false;
@@ -428,7 +430,10 @@ export const make = Effect.gen(function* BrowserSessionMake() {
             ].join("\n"),
             signal: prompt.dialog.signal,
           },
-          previewHostWindow(contents),
+          // In a user's test on Windows, a box owned by the host window blocked
+          // all mouse input, its own buttons included, until it closed. The
+          // keyboard still worked. So Windows shows the box without an owner.
+          platform === "win32" ? undefined : previewHostWindow(contents),
         )
         .pipe(
           Effect.map(({ response }) => response === 0),

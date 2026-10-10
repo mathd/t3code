@@ -2,6 +2,7 @@ import * as NodeEvents from "node:events";
 
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
@@ -99,9 +100,18 @@ const layerPromptDialog = Layer.succeed(ElectronDialog.ElectronDialog, {
     }),
   showErrorBox: () => Effect.void,
 });
-const layerCertificates = BrowserSession.layer.pipe(
-  Layer.provide(Layer.mergeAll(NodeServices.layer, layerPromptDialog, ElectronApp.layer)),
-);
+const layerCertificatesOn = (platform: NodeJS.Platform) =>
+  BrowserSession.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        NodeServices.layer,
+        layerPromptDialog,
+        ElectronApp.layer,
+        Layer.succeed(HostProcess.Platform, platform),
+      ),
+    ),
+  );
+const layerCertificates = layerCertificatesOn("linux");
 const CONTINUE = 0;
 const CANCEL = 1;
 
@@ -479,6 +489,43 @@ describe("BrowserSession", () => {
       assert.isFalse(yield* failed.trusted);
       assert.strictEqual(cancelled.callback.mock.calls.length, 1);
     }).pipe(Effect.provide(layerCertificates)),
+  );
+
+  it.effect.each([
+    { platform: "win32", owner: undefined, label: "without an owner" },
+    { platform: "darwin", owner: hostWindow, label: "on the host window" },
+  ] as const)("settles $platform certificate prompts shown $label", ({ platform, owner }) =>
+    Effect.gen(function* () {
+      const browserSessions = yield* BrowserSession.BrowserSession;
+      const partition = yield* browserSessions.getPartition("scope-a");
+      yield* browserSessions.getSession("scope-a");
+      fromWebContents.mockImplementation((webContents) =>
+        webContents === host ? hostWindow : null,
+      );
+      const tab = makeTab(sessions.get(partition));
+
+      const accepted = certificateError(tab, { url: "https://10.99.0.10/" });
+      yield* answer(0, CONTINUE);
+      assert.isTrue(yield* accepted.trusted);
+
+      const cancelled = certificateError(tab, { url: "https://10.99.0.10:8443/" });
+      yield* answer(1, CANCEL);
+      assert.isFalse(yield* cancelled.trusted);
+
+      const left = certificateError(tab, { url: "https://10.99.0.10:9443/" });
+      tab.startNavigation({ isMainFrame: true, isSameDocument: false });
+      assert.isFalse(yield* left.trusted);
+      assert.isTrue(prompts[2]!.options.signal?.aborted);
+      // A late Continue for the page that left trusts nothing.
+      yield* answer(2, CONTINUE);
+      yield* Deferred.await(prompts[2]!.answered);
+      assertLeftToElectron(
+        certificateError(tab, { url: "https://10.99.0.10:9443/app.js", isMainFrame: false }),
+      );
+
+      assert.strictEqual(prompts.length, 3);
+      for (const prompt of prompts) assert.strictEqual(prompt.owner, owner);
+    }).pipe(Effect.provide(layerCertificatesOn(platform))),
   );
 
   it.effect(
