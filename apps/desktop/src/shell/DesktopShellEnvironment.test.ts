@@ -1,6 +1,9 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Clock from "effect/Clock";
 import { assert, describe, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as PlatformError from "effect/PlatformError";
@@ -9,6 +12,7 @@ import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import * as TestClock from "effect/testing/TestClock";
 import * as NodeOS from "node:os";
 import { vi } from "vite-plus/test";
 
@@ -74,7 +78,10 @@ function runShellEnvironment(input: {
   readonly userShell?: string;
   readonly handler: (
     command: ChildProcess.Command,
-  ) => string | { output: string; exitCode: number };
+  ) =>
+    | string
+    | { output: string; exitCode: number }
+    | Effect.Effect<ChildProcessSpawner.ChildProcessHandle, PlatformError.PlatformError>;
   readonly failure?: PlatformError.PlatformError;
 }) {
   const layerEnvironment = Layer.succeed(
@@ -88,6 +95,7 @@ function runShellEnvironment(input: {
     ChildProcessSpawner.make((command) => {
       if (input.failure !== undefined) return Effect.fail(input.failure);
       const result = input.handler(command);
+      if (Effect.isEffect(result)) return result;
       return Effect.succeed(
         typeof result === "string"
           ? makeProcess(result)
@@ -98,7 +106,9 @@ function runShellEnvironment(input: {
 
   const program = Effect.gen(function* () {
     const shellEnvironment = yield* DesktopShellEnvironment.DesktopShellEnvironment;
-    yield* shellEnvironment.installIntoProcess;
+    const prepared = yield* shellEnvironment.installIntoProcess;
+    assert.equal(yield* shellEnvironment.installIntoProcess, prepared);
+    return prepared;
   }).pipe(
     Effect.provide(
       DesktopShellEnvironment.layer.pipe(
@@ -446,7 +456,7 @@ describe("DesktopShellEnvironment", () => {
         USERPROFILE: "C:\\Users\\testuser",
       };
 
-      yield* runShellEnvironment({
+      const prepared = yield* runShellEnvironment({
         env,
         platform: "win32",
         handler: (command) => {
@@ -462,6 +472,7 @@ describe("DesktopShellEnvironment", () => {
         },
       });
 
+      assert.isTrue(prepared);
       assert.equal(
         env.PATH,
         [
@@ -483,6 +494,169 @@ describe("DesktopShellEnvironment", () => {
         env.FNM_MULTISHELL_PATH,
         "C:\\Users\\testuser\\AppData\\Local\\fnm_multishells\\123",
       );
+    }),
+  );
+
+  it.effect("waits at most 5 seconds in total when the PowerShell profile hangs", () =>
+    Effect.gen(function* () {
+      const env: NodeJS.ProcessEnv = { PATH: "C:\\Windows\\System32" };
+      const profileShells: string[] = [];
+      const started = yield* Deferred.make<void>();
+      const completed = yield* Deferred.make<void>();
+      const baseClock = yield* Clock.Clock;
+      let wallTime = 0;
+      const clockWithBackwardWallJump: Clock.Clock = {
+        ...baseClock,
+        currentTimeMillisUnsafe: () => wallTime,
+        currentTimeMillis: Effect.sync(() => wallTime),
+      };
+
+      const install = yield* Effect.forkChild(
+        runShellEnvironment({
+          env,
+          platform: "win32",
+          handler: (command) => {
+            if (command._tag !== "StandardCommand") return "";
+            if (command.args.includes("-NoProfile")) {
+              return envOutput({ PATH: "C:\\NoProfile\\Bin;C:\\Windows\\System32" });
+            }
+            profileShells.push(command.command);
+            return Deferred.succeed(started, undefined).pipe(
+              Effect.as(
+                ChildProcessSpawner.makeHandle({
+                  ...makeProcess(""),
+                  stdout: Stream.never,
+                  all: Stream.never,
+                  exitCode: Effect.never,
+                  isRunning: Effect.succeed(true),
+                }),
+              ),
+            );
+          },
+        }).pipe(
+          Effect.tap(() => Deferred.succeed(completed, undefined)),
+          Effect.provide(Logger.layer([])),
+          Effect.provideService(Clock.Clock, clockWithBackwardWallJump),
+        ),
+      );
+      yield* Deferred.await(started);
+      wallTime = -60_000;
+      yield* TestClock.adjust("5 seconds");
+      assert.isTrue(yield* Deferred.isDone(completed), "finishes within the shared budget");
+      assert.isFalse(yield* Fiber.join(install));
+      assert.deepEqual(profileShells, ["pwsh.exe"]);
+      assert.equal(env.PATH, "C:\\NoProfile\\Bin;C:\\Windows\\System32");
+    }),
+  );
+
+  it.effect("falls back to Windows PowerShell when pwsh.exe is not installed", () =>
+    Effect.gen(function* () {
+      const env: NodeJS.ProcessEnv = { PATH: "C:\\Windows\\System32" };
+      const missing = PlatformError.systemError({
+        _tag: "NotFound",
+        module: "ChildProcess",
+        method: "spawn",
+        pathOrDescriptor: "pwsh.exe",
+      });
+
+      const prepared = yield* runShellEnvironment({
+        env,
+        platform: "win32",
+        handler: (command) => {
+          if (command._tag !== "StandardCommand") return "";
+          if (command.command === "pwsh.exe") return Effect.fail(missing);
+          return command.args.includes("-NoProfile")
+            ? envOutput({ PATH: "C:\\Windows\\System32" })
+            : envOutput({ PATH: "C:\\Profile\\Node;C:\\Windows\\System32" });
+        },
+      }).pipe(Effect.provide(Logger.layer([])));
+
+      assert.isTrue(prepared);
+      assert.equal(env.PATH, "C:\\Profile\\Node;C:\\Windows\\System32");
+    }),
+  );
+
+  it.effect.each([false, true])(
+    "leaves Windows preparation incomplete when loadProfile=%s fails",
+    (loadProfile) =>
+      Effect.gen(function* () {
+        const env: NodeJS.ProcessEnv = { PATH: "C:\\Windows\\System32" };
+        let calls = 0;
+        const prepared = yield* runShellEnvironment({
+          env,
+          platform: "win32",
+          handler: (command) => {
+            calls++;
+            if (command._tag !== "StandardCommand") return "";
+            return !command.args.includes("-NoProfile") === loadProfile
+              ? { output: "", exitCode: 1 }
+              : envOutput({ PATH: "C:\\Working" });
+          },
+        }).pipe(Effect.provide(Logger.layer([])));
+        assert.isFalse(prepared);
+        assert.equal(calls, 3);
+        assert.include(env.PATH, "C:\\Working");
+        assert.include(env.PATH, "C:\\Windows\\System32");
+      }),
+  );
+
+  it.effect("replaces a Path-spelled Windows PATH instead of adding a second key", () =>
+    Effect.gen(function* () {
+      const env: NodeJS.ProcessEnv = { Path: "C:\\Windows\\System32" };
+
+      yield* runShellEnvironment({
+        env,
+        platform: "win32",
+        handler: (command) =>
+          command._tag === "StandardCommand" && command.args.includes("-NoProfile")
+            ? envOutput({ PATH: "C:\\Shell\\Bin" })
+            : "",
+      });
+
+      assert.deepEqual(env, { PATH: "C:\\Shell\\Bin;C:\\Windows\\System32" });
+    }),
+  );
+
+  it.effect("drops earlier AppImage launches' mount dirs from the search paths on linux", () =>
+    Effect.gen(function* () {
+      const current = "/var/tmp/.mount_cur";
+      const env: NodeJS.ProcessEnv = {
+        SHELL: "/bin/zsh",
+        APPIMAGE: "/home/me/T3-Code.AppImage",
+        APPDIR: `${current}/`,
+        PATH: `${current}/usr/bin:/tmp/.mount_old/usr/bin:/usr/bin`,
+        LD_LIBRARY_PATH: `/tmp/.mount_old/usr/lib:${current}/usr/lib::/opt/lib`,
+        XDG_DATA_DIRS: "/tmp/.mount_old/usr/share:/var/tmp/.mount_cur2/usr/share",
+      };
+
+      yield* runShellEnvironment({
+        env,
+        platform: "linux",
+        handler: () => envOutput({ PATH: "/tmp/.mount_older/usr/bin:/home/me/.local/bin" }),
+      });
+
+      assert.equal(env.PATH, `/home/me/.local/bin:${current}/usr/bin:/usr/bin`);
+      assert.equal(env.LD_LIBRARY_PATH, `${current}/usr/lib::/opt/lib`);
+      assert.equal(env.XDG_DATA_DIRS, undefined);
+    }),
+  );
+
+  it.effect("keeps AppImage-looking search paths outside an AppImage launch", () =>
+    Effect.gen(function* () {
+      const env: NodeJS.ProcessEnv = {
+        SHELL: "/bin/zsh",
+        PATH: "/tmp/.mount_old/usr/bin:/usr/bin",
+        LD_LIBRARY_PATH: "/tmp/.mount_old/usr/lib",
+      };
+
+      yield* runShellEnvironment({
+        env,
+        platform: "linux",
+        handler: () => envOutput({ PATH: "/usr/bin" }),
+      });
+
+      assert.equal(env.PATH, "/usr/bin:/tmp/.mount_old/usr/bin");
+      assert.equal(env.LD_LIBRARY_PATH, "/tmp/.mount_old/usr/lib");
     }),
   );
 

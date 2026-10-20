@@ -14,10 +14,11 @@ import type {
 import type { ServerUpdateStage, ServerUpdateState } from "@t3tools/client-runtime/state/server";
 import {
   isAtomCommandInterrupted,
+  settlePromise,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { CircleArrowUpIcon } from "lucide-react";
-import { type ComponentProps, useRef, useState } from "react";
+import { type ComponentProps, type ReactNode, useRef, useState } from "react";
 
 import { requestConfirmDialog } from "~/confirmDialog";
 import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
@@ -30,9 +31,6 @@ import { Button } from "./ui/button";
 import { toastManager } from "./ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 
-// The wire "installing" stage is a sub-second launcher handoff, so the UI
-// folds it into the download phase; everything after the handoff is the
-// restart the user is actually waiting through.
 const UPDATE_STAGE_LABELS: Record<ServerUpdateStage, string> = {
   downloading: "Downloading…",
   installing: "Downloading…",
@@ -59,20 +57,26 @@ export interface ServerUpdateTarget {
   readonly continueThreadsAfterServerUpdate?: boolean;
 }
 
+export type PendingServerUpdate = Omit<ServerUpdateTarget, "continueThreadsAfterServerUpdate"> & {
+  readonly serverVersion: string;
+};
+
+export interface ServerUpdateControl {
+  readonly label: string;
+  readonly disabled: boolean;
+  readonly onClick: () => void;
+}
+
 type UpdateButtonProps = Pick<ComponentProps<typeof Button>, "variant" | "size" | "className"> & {
   readonly label?: string;
-  /** "icon" renders a compact icon button with the label in a tooltip. */
   readonly appearance?: "button" | "icon";
 };
 
-/** What {@link useServerUpdate} did. "skipped" covers a missing permission, an
-    update already in flight, and an interrupted request. */
 export type ServerUpdateOutcome =
   | { readonly status: "updated" | "skipped" }
   | { readonly status: "failed"; readonly message: string };
 
-/** Updates one server and waits until it is back on the target version.
-    Toasts its success or failure unless `quiet`; never rejects. */
+/** Toasts its success or failure unless `quiet`; never rejects. */
 export function useServerUpdate() {
   const updateServer = useAtomCommand(serverEnvironment.updateServer, { reportFailure: false });
   return async (
@@ -86,33 +90,19 @@ export function useServerUpdate() {
     )
       return { status: "skipped" };
     pendingUpdateEnvironmentIds.add(environmentId);
-    try {
-      const result = await updateServer({
-        environmentId,
-        input: {
-          targetVersion,
-          ...(target.threadContinuation && target.continueThreadsAfterServerUpdate
-            ? { continueRunningThreads: true }
-            : {}),
-        },
-      });
-      if (result._tag === "Failure") {
-        if (isAtomCommandInterrupted(result)) return { status: "skipped" };
-        throw squashAtomCommandFailure(result);
-      }
-      if (!quiet) {
-        toastManager.add({
-          type: "success",
-          title: `${serverLabel} updated`,
-          description:
-            selfUpdate === "desktop-managed"
-              ? `Desktop app relaunched on ${result.value.targetVersion}.`
-              : `Reconnected on t3@${result.value.targetVersion}.`,
-        });
-      }
-      return { status: "updated" };
-    } catch (error) {
-      const message = updateFailureMessage(error);
+    const result = await updateServer({
+      environmentId,
+      input: {
+        targetVersion,
+        ...(target.threadContinuation && target.continueThreadsAfterServerUpdate
+          ? { continueRunningThreads: true }
+          : {}),
+      },
+    });
+    pendingUpdateEnvironmentIds.delete(environmentId);
+    if (result._tag === "Failure") {
+      if (isAtomCommandInterrupted(result)) return { status: "skipped" };
+      const message = updateFailureMessage(squashAtomCommandFailure(result));
       if (!quiet) {
         toastManager.add({
           type: "error",
@@ -121,13 +111,21 @@ export function useServerUpdate() {
         });
       }
       return { status: "failed", message };
-    } finally {
-      pendingUpdateEnvironmentIds.delete(environmentId);
     }
+    if (!quiet) {
+      toastManager.add({
+        type: "success",
+        title: `${serverLabel} updated`,
+        description:
+          selfUpdate === "desktop-managed"
+            ? `Desktop app relaunched on ${result.value.targetVersion}.`
+            : `Reconnected on t3@${result.value.targetVersion}.`,
+      });
+    }
+    return { status: "updated" };
   };
 }
 
-/** Updates eligible machines independently; manual paths remain in the machine list. */
 export function ServerUpdatesAction({
   targets,
   label = "Update all",
@@ -149,7 +147,7 @@ export function ServerUpdatesAction({
     if (pending.current) return;
     pending.current = true;
     setIsPending(true);
-    try {
+    await settlePromise(async () => {
       const available = eligible.filter(
         (target) => !pendingUpdateEnvironmentIds.has(target.environmentId),
       );
@@ -162,10 +160,9 @@ export function ServerUpdatesAction({
         if (!confirmed) return;
       }
       await Promise.all(available.map((target) => update(target)));
-    } finally {
-      pending.current = false;
-      setIsPending(false);
-    }
+    });
+    pending.current = false;
+    setIsPending(false);
   };
   return (
     <Button
@@ -187,12 +184,6 @@ export function canUpdateServer(
   return sessionGrantsScope(result.value, AuthEnvironmentMaintainScope);
 }
 
-/**
- * One-row status for an in-flight server update: "Downloading…" then
- * "Restarting…". The update is a wait, not a warning: a single static dot
- * and label, no step rail, no versions. Failure turns the row red with the
- * rollback reason.
- */
 export function ServerUpdateProgress({
   state,
 }: {
@@ -218,9 +209,8 @@ export function ServerUpdateProgress({
 }
 
 /**
- * Offers the update path advertised by a version-skewed server. Self-updates
- * delegate their full lifecycle to client-runtime so this component can
- * unmount during reconnect without losing operation state.
+ * Self-updates delegate their full lifecycle to client-runtime so this component can unmount
+ * during reconnect without losing operation state.
  */
 export function ServerUpdateAction({
   environmentId,
@@ -235,8 +225,13 @@ export function ServerUpdateAction({
   size = "xs",
   className,
   appearance = "button",
-}: Omit<ServerUpdateTarget, "continueThreadsAfterServerUpdate"> & UpdateButtonProps) {
+  render,
+}: Omit<ServerUpdateTarget, "continueThreadsAfterServerUpdate"> &
+  UpdateButtonProps & {
+    readonly render?: (control: ServerUpdateControl) => ReactNode;
+  }) {
   const isDesktopAppUpdate = selfUpdate === "desktop-managed";
+  const unsupportedDesktopUpdate = isDesktopAppUpdate && !desktopAppUpdate;
   const sessionStateAtom = environmentSession.sessionStateAtom(environmentId);
   const canUpdate = canUpdateServer(useAtomValue(sessionStateAtom));
   const continueThreadsAfterServerUpdate = useEnvironmentSettings(
@@ -268,15 +263,13 @@ export function ServerUpdateAction({
 
   const handleUpdate = async () => {
     if (
+      unsupportedDesktopUpdate ||
       !canUpdateServer(appAtomRegistry.get(sessionStateAtom)) ||
       pendingUpdateEnvironmentIds.has(environmentId)
     ) {
       return;
     }
     if (isDesktopAppUpdate) {
-      // No themed host mounted (undefined) means proceed: the click itself
-      // was the request. This is the only confirmation in the flow; the
-      // remote machine installs without asking anyone there.
       const confirmed =
         (await requestConfirmDialog(
           `Update the T3 Code desktop app that runs the ${serverLabel}? It will close and relaunch on that machine.`,
@@ -297,18 +290,11 @@ export function ServerUpdateAction({
     });
   };
 
-  if (selfUpdate === "desktop-managed" && !desktopAppUpdate) {
-    return (
-      <span className="text-muted-foreground text-xs">
-        Update the desktop app on that machine to update this server.
-      </span>
-    );
-  }
-
   const manualCommand =
     selfUpdate === null ? manualServerUpdateCommand(targetVersion, installation) : null;
-  const actionLabel =
-    manualCommand !== null
+  const actionLabel = unsupportedDesktopUpdate
+    ? "Update the desktop app on"
+    : manualCommand !== null
       ? installation?.kind === "npm-global"
         ? "Copy update command"
         : "Copy relaunch command"
@@ -317,6 +303,17 @@ export function ServerUpdateAction({
     manualCommand !== null
       ? () => copyToClipboard(manualCommand, { command: manualCommand })
       : () => void handleUpdate();
+  const disabled = unsupportedDesktopUpdate || (manualCommand === null && !canUpdate);
+
+  if (render) return render({ label: actionLabel, disabled, onClick });
+
+  if (unsupportedDesktopUpdate) {
+    return (
+      <span className="text-muted-foreground text-xs">
+        Update the desktop app on that machine to update this server.
+      </span>
+    );
+  }
 
   if (appearance === "icon") {
     return (
@@ -328,7 +325,7 @@ export function ServerUpdateAction({
               variant="ghost-muted"
               className={className}
               aria-label={`${actionLabel} for ${serverLabel}`}
-              disabled={manualCommand === null && !canUpdate}
+              disabled={disabled}
               onClick={onClick}
             />
           }
@@ -345,7 +342,7 @@ export function ServerUpdateAction({
       size={size}
       variant={variant}
       className={className}
-      disabled={manualCommand === null && !canUpdate}
+      disabled={disabled}
       onClick={onClick}
     >
       {actionLabel}
@@ -354,8 +351,7 @@ export function ServerUpdateAction({
 }
 
 /**
- * Updates a host too old for this client to connect to. Its version comes
- * from the host descriptor because the host never delivers a server config.
+ * Its version comes from the host descriptor because the host never delivers a server config.
  */
 export function OutdatedServerUpdateAction({
   environmentId,
@@ -374,30 +370,26 @@ export function OutdatedServerUpdateAction({
   const handleUpdate = async () => {
     if (pendingUpdateEnvironmentIds.has(environmentId)) return;
     pendingUpdateEnvironmentIds.add(environmentId);
-    try {
-      const result = await update({
-        environmentId,
-        input: { targetVersion },
-        ...(fromVersion === undefined ? {} : { fromVersion }),
-      });
-      if (result._tag === "Failure") {
-        if (isAtomCommandInterrupted(result)) return;
-        throw squashAtomCommandFailure(result);
-      }
-      toastManager.add({
-        type: "success",
-        title: `${serverLabel} updated`,
-        description: `Reconnected on t3@${result.value.targetVersion}.`,
-      });
-    } catch (error) {
+    const result = await update({
+      environmentId,
+      input: { targetVersion },
+      ...(fromVersion === undefined ? {} : { fromVersion }),
+    });
+    pendingUpdateEnvironmentIds.delete(environmentId);
+    if (result._tag === "Failure") {
+      if (isAtomCommandInterrupted(result)) return;
       toastManager.add({
         type: "error",
         title: `${serverLabel} update failed`,
-        description: updateFailureMessage(error),
+        description: updateFailureMessage(squashAtomCommandFailure(result)),
       });
-    } finally {
-      pendingUpdateEnvironmentIds.delete(environmentId);
+      return;
     }
+    toastManager.add({
+      type: "success",
+      title: `${serverLabel} updated`,
+      description: `Reconnected on t3@${result.value.targetVersion}.`,
+    });
   };
   return (
     <Button size="xs" variant="outline" onClick={() => void handleUpdate()}>

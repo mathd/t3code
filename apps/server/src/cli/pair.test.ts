@@ -11,8 +11,11 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assert, describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command, CliError } from "effect/cli";
+import { ChildProcessSpawner } from "effect/process";
 
 import { cli } from "../binCli.ts";
 import {
@@ -97,9 +100,6 @@ const runCli = (args: ReadonlyArray<string>) => Command.runWith(cli, { version: 
 const provideCliTestLayers = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.provide(effect, Layer.mergeAll(layerCliRuntime, TestConsole.layer));
 
-// Console output accumulates across CLI runs within a test, and each
-// Console.log call is one entry — so the latest command's output is the last
-// entry, even when it spans many lines.
 const captureStdout = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   provideCliTestLayers(
     Effect.gen(function* () {
@@ -164,13 +164,11 @@ describe("t3 pair", () => {
         assert.include(output, `Pairing with pair-test (${origin})`);
         assert.include(output, `Pairing URL: ${origin}/pair#token=`);
         assert.isTrue(output.includes("█") || output.includes("▀") || output.includes("▄"));
-        // Loopback origins are not reachable from a phone; the output must say so.
         assert.include(output, "only reachable from this machine");
 
         const token = /#token=([A-Z2-9]+)/.exec(output)?.[1];
         assert.isString(token);
 
-        // The token must be in the same store the running server reads.
         const listed = yield* captureStdout(
           runCli(["auth", "pairing", "list", "--base-dir", baseDir, "--json"]),
         );
@@ -280,16 +278,12 @@ describe("t3 pair", () => {
       Effect.gen(function* () {
         const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pair-pid-test-"));
         const statePath = NodePath.join(baseDir, "userdata", "server-runtime.json");
-        // The origin answers (another server reused the port), but the pid
-        // that wrote this state file is dead — pairing must not mint a token
-        // into the dead server's database.
         const state = yield* makePersistedServerRuntimeState({
           config: { host: "127.0.0.1", devUrl: undefined },
           port: Number(new URL(origin).port),
         });
         yield* persistServerRuntimeState({
           path: statePath,
-          // pid 2**22 + 1 exceeds any default Linux/macOS pid range.
           state: { ...state, pid: 4_194_305 },
         });
 
@@ -309,8 +303,6 @@ describe("t3 pair", () => {
     Effect.gen(function* () {
       const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pair-stale-test-"));
       const statePath = NodePath.join(baseDir, "userdata", "server-runtime.json");
-      // A port from the dynamic range with nothing listening: the probe fails
-      // fast with ECONNREFUSED and discovery moves on.
       yield* persistServerRuntimeState({
         path: statePath,
         state: yield* makePersistedServerRuntimeState({
@@ -328,6 +320,58 @@ describe("t3 pair", () => {
       );
       assert.include(rendered, "No running T3 Code server found.");
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  // Without the capability `tailscale serve` blocks on an enablement URL, so
+  // pairing must stop at status instead of spawning it.
+  it.effect("explains a tailnet without HTTPS serve instead of running tailscale serve", () =>
+    withDescriptorServer((origin) =>
+      Effect.gen(function* () {
+        const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pair-ts-test-"));
+        yield* persistServerRuntimeState({
+          path: NodePath.join(baseDir, "userdata", "server-runtime.json"),
+          state: yield* makePersistedServerRuntimeState({
+            config: { host: "127.0.0.1", devUrl: undefined },
+            port: Number(new URL(origin).port),
+          }),
+        });
+        const tailscaleCalls: Array<ReadonlyArray<string>> = [];
+        const spawner = ChildProcessSpawner.make((command) => {
+          const { args } = command as unknown as { readonly args: ReadonlyArray<string> };
+          tailscaleCalls.push(args);
+          const stdout =
+            args[0] === "status"
+              ? `{"Self":{"DNSName":"pair-test.invalid.","CapMap":{"funnel":null}}}`
+              : "";
+          return Effect.succeed(
+            ChildProcessSpawner.makeHandle({
+              pid: ChildProcessSpawner.ProcessId(1),
+              exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(args[0] === "status" ? 0 : 1)),
+              isRunning: Effect.succeed(false),
+              kill: () => Effect.void,
+              unref: Effect.succeed(Effect.void),
+              stdin: Sink.drain,
+              stdout: Stream.make(new TextEncoder().encode(stdout)),
+              stderr: Stream.empty,
+              all: Stream.empty,
+              getInputFd: () => Sink.drain,
+              getOutputFd: () => Stream.empty,
+            }),
+          );
+        });
+
+        const error = yield* provideCliTestLayers(
+          runCli(["pair", "--base-dir", baseDir, "--tailscale"]).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.flip,
+          ),
+        );
+
+        assert.include(String(error), "Tailscale Serve is not enabled on your tailnet.");
+        assert.include(String(error), "https://login.tailscale.com/admin/dns");
+        assert.deepEqual(tailscaleCalls, [["status", "--json"]]);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
   );
 });
 

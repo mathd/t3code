@@ -79,36 +79,42 @@ const testState = vi.hoisted(() => {
   };
 });
 
+const testServerConfigs = () =>
+  new Map([
+    [
+      "environment-primary",
+      {
+        settings: {
+          ...testState.targetSettings,
+          newWorktreesStartFromOrigin: !testState.targetSettings.newWorktreesStartFromOrigin,
+        },
+      },
+    ],
+    ["environment-ssh", { settings: testState.targetSettings }],
+  ]);
+
+vi.mock("../rpc/atomRegistry", () => ({
+  appAtomRegistry: { get: () => testServerConfigs() },
+}));
+
 vi.mock("@effect/atom-react", () => ({
   useAtomValue: (atom: unknown) =>
     atom === "primary-settings"
       ? { newWorktreesStartFromOrigin: !testState.targetSettings.newWorktreesStartFromOrigin }
-      : new Map([
-          [
-            "environment-primary",
-            {
-              settings: {
-                ...testState.targetSettings,
-                newWorktreesStartFromOrigin: !testState.targetSettings.newWorktreesStartFromOrigin,
-              },
-            },
-          ],
-          ["environment-ssh", { settings: testState.targetSettings }],
-        ]),
+      : testServerConfigs(),
 }));
-vi.mock("@t3tools/client-runtime/environment", () => ({
+vi.mock("@t3tools/client-runtime/environment", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@t3tools/client-runtime/environment")>()),
   scopedProjectKey: () => "remote-project",
   scopeProjectRef: (environmentId: string, projectId: string) => ({ environmentId, projectId }),
   scopeThreadRef: (environmentId: string, threadId: string) => ({ environmentId, threadId }),
 }));
-vi.mock("@t3tools/contracts", () => ({
+vi.mock("@t3tools/contracts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@t3tools/contracts")>()),
   DEFAULT_RUNTIME_MODE: "default",
   DEFAULT_SERVER_SETTINGS: {},
 }));
 vi.mock("@t3tools/shared/projectSettings", () => ({
-  // Environment settings pass through; the tests set project fields on the
-  // project record, which the hook still honors until the server folds them.
-  // With a file argument the env mode resolves like the real chain.
   resolveProjectSettings: (
     settings: Record<string, unknown>,
     _projectId: unknown,
@@ -126,7 +132,6 @@ vi.mock("@t3tools/shared/projectSettings", () => ({
     sources: { defaultModelSelection: "environment", defaultThreadEnvMode: "environment" },
     overrides: {},
   }),
-  // The new-project rule has its own tests in projectSettings.test.ts.
   resolveNewThreadEnvMode: (input: {
     projectSettings: { settings: { defaultThreadEnvMode: "local" | "worktree" } };
   }) => input.projectSettings.settings.defaultThreadEnvMode,
@@ -135,7 +140,8 @@ vi.mock("@tanstack/react-router", () => ({
   useParams: () => null,
   useRouter: () => testState.router,
 }));
-vi.mock("react", () => ({
+vi.mock("react", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react")>()),
   useCallback: <T>(callback: T) => callback,
   useMemo: <T>(factory: () => T) => factory(),
 }));
@@ -196,6 +202,49 @@ vi.mock("../uiStateStore", () => ({
 vi.mock("./useSettings", () => ({ useClientSettings: () => ({}) }));
 
 import { useNewThreadHandler } from "./useHandleNewThread";
+import { useComposerDraftStore } from "../composerDraftStore";
+
+it("pins a reused automatic draft to the explicitly selected checkout", async () => {
+  const { useComposerDraftStore: realDraftStore, DraftId } =
+    await vi.importActual<typeof import("../composerDraftStore")>("../composerDraftStore");
+  const { EnvironmentId, ProjectId, ThreadId } =
+    await vi.importActual<typeof import("@t3tools/contracts")>("@t3tools/contracts");
+  testState.reset(null);
+  const draftId = DraftId.make("draft-manual-checkout");
+  const projectRef = {
+    environmentId: EnvironmentId.make("environment-ssh"),
+    projectId: ProjectId.make("project-remote"),
+  };
+  const store = realDraftStore.getState();
+  store.setLogicalProjectDraftThreadId(
+    "remote-project",
+    {
+      environmentId: EnvironmentId.make("environment-primary"),
+      projectId: ProjectId.make("local"),
+    },
+    draftId,
+    {
+      threadId: ThreadId.make("thread-manual-checkout"),
+      environmentSelection: "auto",
+      loadBalancedEnvironmentId: EnvironmentId.make("environment-primary"),
+    },
+  );
+  const getState = vi.spyOn(useComposerDraftStore, "getState").mockReturnValue(store);
+  try {
+    const opened = await useNewThreadHandler()(projectRef, { environmentSelection: "manual" });
+
+    expect(opened?.draftId).toBe(draftId);
+    expect(store.getDraftSession(draftId)).toMatchObject({
+      environmentId: projectRef.environmentId,
+      projectId: projectRef.projectId,
+      environmentSelection: "manual",
+      loadBalancedEnvironmentId: null,
+    });
+  } finally {
+    getState.mockRestore();
+    realDraftStore.setState(store, true);
+  }
+});
 
 describe.each([
   ["new", null],

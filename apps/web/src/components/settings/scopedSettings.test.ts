@@ -158,6 +158,7 @@ describe("scoped settings writes", () => {
           mode: "custom",
           rules: {
             worktreeAfterDays: 12,
+            worktreeSettledAfterDays: null,
             worktreeOnDelete: true,
             worktreeOnMerge: true,
             worktreeUnchanged: false,
@@ -182,6 +183,7 @@ describe("scoped settings writes", () => {
     expect(policies).toEqual([
       {
         worktreeAfterDays: 12,
+        worktreeSettledAfterDays: null,
         worktreeOnDelete: false,
         worktreeOnMerge: true,
         worktreeUnchanged: false,
@@ -189,6 +191,7 @@ describe("scoped settings writes", () => {
       },
       {
         worktreeAfterDays: null,
+        worktreeSettledAfterDays: null,
         worktreeOnDelete: false,
         worktreeOnMerge: false,
         worktreeUnchanged: false,
@@ -231,7 +234,6 @@ describe("scoped settings writes", () => {
   });
 
   describe("an environment that saves but drops keys it does not know", () => {
-    // Laptop knows every key; Server is an older build that keeps its settings as they were.
     const upgradedLaptop = (saved: Partial<ServerSettings>) =>
       vi.fn(async ({ environmentId }: { environmentId: EnvironmentId }) => ({
         _tag: "Success" as const,
@@ -381,6 +383,7 @@ describe("scoped settings writes", () => {
               mode: "custom",
               rules: {
                 worktreeAfterDays: 8,
+                worktreeSettledAfterDays: null,
                 worktreeOnDelete: false,
                 worktreeOnMerge: true,
                 worktreeUnchanged: false,
@@ -394,6 +397,15 @@ describe("scoped settings writes", () => {
     const plan = planScopedSettingsPatch(project, [machine, customized], {
       worktreeCleanup: { mode: "custom", rules: { worktreeOnDelete: true } },
     });
+    const settledPlan = planScopedSettingsPatch(project, [machine, customized], {
+      worktreeCleanup: { mode: "custom", rules: { worktreeSettledAfterDays: 0 } },
+    });
+    expect(
+      settledPlan.serverWrites.map((write) => write.patch.projectSettingsOverrides),
+    ).toMatchObject([
+      { [projectId]: { worktreeCleanup: { rules: { worktreeSettledAfterDays: 0 } } } },
+      { [laptopProjectId]: { worktreeCleanup: { rules: { worktreeSettledAfterDays: 0 } } } },
+    ]);
     expect(plan.serverWrites.map((write) => write.patch.projectSettingsOverrides)).toEqual([
       {
         [projectId]: {
@@ -402,6 +414,7 @@ describe("scoped settings writes", () => {
             mode: "custom",
             rules: {
               worktreeAfterDays: 8,
+              worktreeSettledAfterDays: null,
               worktreeOnDelete: true,
               worktreeOnMerge: true,
               worktreeUnchanged: false,
@@ -416,6 +429,7 @@ describe("scoped settings writes", () => {
             mode: "custom",
             rules: {
               worktreeAfterDays: 30,
+              worktreeSettledAfterDays: null,
               worktreeOnDelete: true,
               worktreeOnMerge: false,
               worktreeUnchanged: false,
@@ -749,4 +763,60 @@ it("routes legacy model preference keys exclusively to the selected environment"
       patch,
     },
   ]);
+});
+
+describe("model selection patches at project scope", () => {
+  const codex = ProviderInstanceId.make("codex");
+  const claude = ProviderInstanceId.make("claudeAgent");
+  const saved = {
+    instanceId: codex,
+    model: "gpt-5.6",
+    options: [{ id: "reasoningEffort", value: "high" }],
+  };
+  const customized = environment("Server", {
+    settings: {
+      projectSettingsOverrides: {
+        [projectId]: {
+          defaultModelSelection: saved,
+          sourceControlWriterModelSelection: saved,
+          reviewGuideModelSelection: saved,
+          textGenerationModelSelection: saved,
+        },
+      },
+    },
+  });
+
+  it("replaces old options when changing model selections", () => {
+    const plan = planScopedSettingsPatch(checkout, [customized], {
+      defaultModelSelection: { instanceId: claude, model: "claude-opus-4-8" },
+      sourceControlWriterModelSelection: { instanceId: codex, model: "gpt-5.6-mini" },
+      reviewGuideModelSelection: { instanceId: codex, model: "gpt-5.6-mini" },
+      textGenerationModelSelection: { instanceId: claude, model: "claude-sonnet-4-6" },
+    });
+    expect(plan.serverWrites[0]?.patch.projectSettingsOverrides?.[projectId]).toEqual({
+      defaultModelSelection: { instanceId: claude, model: "claude-opus-4-8" },
+      sourceControlWriterModelSelection: { instanceId: codex, model: "gpt-5.6-mini" },
+      reviewGuideModelSelection: { instanceId: codex, model: "gpt-5.6-mini" },
+      textGenerationModelSelection: { instanceId: claude, model: "claude-sonnet-4-6" },
+    });
+  });
+
+  it("completes partial text-generation selections without retaining old options", () => {
+    const modelPlan = planScopedSettingsPatch(checkout, [customized], {
+      textGenerationModelSelection: { model: "gpt-5.6-mini" },
+    });
+    expect(
+      modelPlan.serverWrites[0]?.patch.projectSettingsOverrides?.[projectId]
+        ?.textGenerationModelSelection,
+    ).toEqual({ instanceId: codex, model: "gpt-5.6-mini" });
+
+    const options = [{ id: "reasoningEffort", value: "low" }];
+    const optionsPlan = planScopedSettingsPatch(checkout, [customized], {
+      textGenerationModelSelection: { options },
+    });
+    expect(
+      optionsPlan.serverWrites[0]?.patch.projectSettingsOverrides?.[projectId]
+        ?.textGenerationModelSelection,
+    ).toEqual({ ...saved, options });
+  });
 });

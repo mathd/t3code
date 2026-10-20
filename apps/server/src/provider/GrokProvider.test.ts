@@ -402,7 +402,12 @@ it.layer(NodeServices.layer)("checkGrokProviderStatus", (it) => {
 
   // A stand-in for the Grok CLI: `--version` and `models` print canned text,
   // and `agent stdio` execs the mock ACP agent so `initialize` returns model metadata.
-  const writeFakeGrokCli = (input: { readonly modelsOutput: string; readonly acp: boolean }) =>
+  // A list of `models` outputs is served in call order, repeating the last one.
+  const writeFakeGrokCli = (input: {
+    readonly modelsOutput: string | ReadonlyArray<string>;
+    readonly acp: boolean;
+    readonly updateLogPath?: string;
+  }) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-grok-probe-" });
@@ -411,12 +416,25 @@ it.layer(NodeServices.layer)("checkGrokProviderStatus", (it) => {
         directory: dir,
         name: "grok",
         source: [
+          ...(input.updateLogPath
+            ? [
+                'import { appendFileSync as appendUpdateAttempt } from "node:fs";',
+                'if (process.env.GROK_DISABLE_AUTOUPDATER !== "1") {',
+                `  appendUpdateAttempt(${JSON.stringify(input.updateLogPath)}, "update\\n");`,
+                "}",
+              ]
+            : []),
           'if (process.argv[2] === "--version") {',
           '  process.stdout.write("grok 1.0.13\\n");',
           "  process.exit(0);",
           "}",
           'if (process.argv[2] === "models") {',
-          `  process.stdout.write(${JSON.stringify(input.modelsOutput)});`,
+          '  const fs = await import("node:fs");',
+          `  const callsPath = ${JSON.stringify(NodePath.join(dir, "models-calls"))};`,
+          '  const calls = fs.existsSync(callsPath) ? fs.readFileSync(callsPath, "utf8").length : 0;',
+          '  fs.appendFileSync(callsPath, ".");',
+          `  const outputs = ${JSON.stringify([input.modelsOutput].flat())};`,
+          "  process.stdout.write(outputs[Math.min(calls, outputs.length - 1)]);",
           "  process.exit(0);",
           "}",
           'if (process.argv[2] !== "agent") process.exit(1);',
@@ -426,21 +444,29 @@ it.layer(NodeServices.layer)("checkGrokProviderStatus", (it) => {
       });
     });
 
-  it.effect("reports ready with ACP-discovered models when logged in", () =>
+  it.effect("reports ready with ACP-discovered models without running startup updates", () =>
     Effect.gen(function* () {
-      const snapshot = yield* Effect.scoped(
+      const environment = { ...process.env, XAI_API_KEY: "", GROK_DISABLE_AUTOUPDATER: "0" };
+      const { snapshot, updateRan } = yield* Effect.scoped(
         Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-grok-updater-" });
+          const updateLogPath = NodePath.join(dir, "updates.log");
           const grokPath = yield* writeFakeGrokCli({
             modelsOutput: LOGGED_IN_MODELS_OUTPUT,
             acp: true,
+            updateLogPath,
           });
-          return yield* checkGrokProviderStatus(
+          const snapshot = yield* checkGrokProviderStatus(
             decodeGrokSettings({ enabled: true, binaryPath: grokPath }),
-            { ...process.env, XAI_API_KEY: "" },
+            environment,
           );
+          return { snapshot, updateRan: yield* fs.exists(updateLogPath) };
         }),
       );
 
+      expect(updateRan).toBe(false);
+      expect(environment.GROK_DISABLE_AUTOUPDATER).toBe("0");
       expect(snapshot.status).toBe("ready");
       expect(snapshot.version).toBe("1.0.13");
       expect(snapshot.auth).toEqual({
@@ -448,7 +474,6 @@ it.layer(NodeServices.layer)("checkGrokProviderStatus", (it) => {
         type: "cached_token",
         label: "Grok account",
       });
-      // The mock agent advertises grok-4.6 with reasoning options in initialize._meta.
       expect(snapshot.models.map((model) => model.slug)).toEqual(["grok-4.6", "grok-mock-alt"]);
       expect(snapshot.models[0]?.isDefault).toBe(true);
       expect(
@@ -476,6 +501,28 @@ it.layer(NodeServices.layer)("checkGrokProviderStatus", (it) => {
       expect(snapshot.auth.status).toBe("unauthenticated");
       expect(snapshot.message).toContain("grok login");
       expect(snapshot.models.map((model) => model.slug)).toEqual(["grok-4.6", "grok-mock-alt"]);
+    }),
+  );
+
+  // An expired access token prints the logged-out banner, then the CLI refreshes it in the
+  // same run, so the next `grok models` reports the login (#14285).
+  it.effect("reports authenticated when `grok models` logs in after refreshing a token", () =>
+    Effect.gen(function* () {
+      const snapshot = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const grokPath = yield* writeFakeGrokCli({
+            modelsOutput: [LOGGED_OUT_MODELS_OUTPUT, LOGGED_IN_MODELS_OUTPUT],
+            acp: true,
+          });
+          return yield* checkGrokProviderStatus(
+            decodeGrokSettings({ enabled: true, binaryPath: grokPath }),
+            { ...process.env, XAI_API_KEY: "" },
+          );
+        }),
+      );
+
+      expect(snapshot.status).toBe("ready");
+      expect(snapshot.auth.status).toBe("authenticated");
     }),
   );
 
@@ -562,9 +609,6 @@ describe("Grok usage limits", () => {
     for (const response of [{}, { config: {} }, { config: { creditUsagePercent: NaN } }]) {
       const limits = grokUsageResponseToLimits(response, checkedAt);
       expect(limits.windows).toEqual([]);
-      // Nothing metered yet, which xAI reports by omitting the field until
-      // usage registers. Marking it `unsupported` would drop the account from
-      // the Limits view for good; leaving the marker off keeps it listed.
       expect(limits.unavailable).toBeUndefined();
     }
     expect(
